@@ -15,6 +15,11 @@ services:
       - LANGS=${STIRLING_LANGS}
       - INSTALL_BOOK_AND_ADVANCED_HTML_OPS=${STIRLING_ADVANCED_OPS}
       - TZ=${TZ}
+      # Do NOT let Stirling prune JWT signing keys: KeyPairCleanupService deletes
+      # every key older than ~34 days without excluding the one it is still signing
+      # with, so logins 500 ("Unable to retrieve key pair for active key") once the
+      # container passes that uptime. Upstream Stirling-PDF issue #5846.
+      - SECURITY_JWT_ENABLEKEYCLEANUP=false
     volumes:
       - ./data:/usr/share/tessdata # OCR language data
       - ./config:/configs # Custom configurations
