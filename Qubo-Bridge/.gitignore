@@ -1,0 +1,6 @@
+# secrets + runtime state — never commit
+qubo.env
+data/
+*.session.json
+__pycache__/
+*.pyc

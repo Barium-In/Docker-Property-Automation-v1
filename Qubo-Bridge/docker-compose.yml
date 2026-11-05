@@ -1,0 +1,29 @@
+# Qubo HCM01B → local RTSP, for Home Assistant. Two services:
+#   mediamtx     — RTSP/WebRTC server HA connects to (rtsp://<vm-ip>:8554/qubo)
+#   qubo-bridge  — pulls the camera's encrypted P2P stream over the LAN,
+#                  decrypts it, and publishes H.264(+AAC) to mediamtx.
+#
+# HOST NETWORKING is required: the camera streams P2P UDP to the VM's LAN IP,
+# which Docker's bridge NAT would break. See README.
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: qubo-mediamtx
+    restart: unless-stopped
+    network_mode: host
+    # Read credentials live literally in mediamtx.yml (mediamtx doesn't expand env vars).
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+
+  qubo-bridge:
+    build: .
+    image: qubo-bridge:local
+    container_name: qubo-bridge
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - mediamtx
+    env_file:
+      - ./qubo.env
+    volumes:
+      - ./data:/data        # qubopy session + stable device id persist here

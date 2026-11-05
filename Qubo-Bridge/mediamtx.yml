@@ -1,0 +1,38 @@
+# mediamtx config for the Qubo bridge.
+# The bridge's ffmpeg publishes to path "qubo"; Home Assistant reads it.
+logLevel: info
+rtspTransports: [tcp]
+
+# --- protocols ---
+rtsp: yes
+rtspAddress: :8554
+webrtc: yes
+webrtcAddress: :8889
+hls: no
+rtmp: no
+srt: no
+api: no
+
+# --- auth ---------------------------------------------------------------------
+# Localhost (the bridge, publishing from 127.0.0.1) may publish+read with no
+# credentials. Everyone else (Home Assistant, any LAN/tailnet client) must
+# supply the read user/pass below. This both password-protects viewing AND stops
+# anyone on the LAN from hijacking the "qubo" path by publishing to it.
+#
+# NOTE: mediamtx does NOT expand ${ENV_VARS} in this file — put the credentials
+# here LITERALLY, and use the same user/pass in Home Assistant. Once filled in,
+# this file holds a password: keep it off any public remote.
+authInternalUsers:
+  - user: any
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: publish
+      - action: read
+  - user: REPLACE_WITH_READ_USER
+    pass: REPLACE_WITH_READ_PASS
+    permissions:
+      - action: read
+
+paths:
+  qubo:
+    source: publisher
