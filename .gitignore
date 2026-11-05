@@ -1,7 +1,7 @@
 # Environment files
-#.env
-#.env.local
-#.env.*.local
+.env
+.env.local
+.env.*.local
 
 # Docker data directories (uncomment if you don't want to track empty directories)
 # */data/

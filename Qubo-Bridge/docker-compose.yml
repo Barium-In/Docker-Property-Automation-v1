@@ -7,11 +7,14 @@
 # which Docker's bridge NAT would break. See README.
 services:
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    image: bluenviron/mediamtx:${MEDIAMTX_VERSION}
     container_name: qubo-mediamtx
     restart: unless-stopped
     network_mode: host
-    # Read credentials live literally in mediamtx.yml (mediamtx doesn't expand env vars).
+    # The read login comes from the root .env. Index 1 is the second user in mediamtx.yml.
+    environment:
+      - "MTX_AUTHINTERNALUSERS_1_USER=${QUBO_RTSP_READ_USER:?set it in the root .env}"
+      - "MTX_AUTHINTERNALUSERS_1_PASS=${QUBO_RTSP_READ_PASS:?set it in the root .env}"
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
 
@@ -24,6 +27,10 @@ services:
     depends_on:
       - mediamtx
     env_file:
-      - ./qubo.env
+      - ../.env
+    environment:
+      - TZ=${TZ}
+      - RTSP_PUBLISH_URL=${QUBO_RTSP_PUBLISH_URL:-rtsp://127.0.0.1:8554/qubo}
+      - LOG_LEVEL=${QUBO_LOG_LEVEL:-INFO}
     volumes:
       - ./data:/data        # qubopy session + stable device id persist here

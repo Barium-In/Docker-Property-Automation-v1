@@ -16,12 +16,12 @@ api: no
 # --- auth ---------------------------------------------------------------------
 # Localhost (the bridge, publishing from 127.0.0.1) may publish+read with no
 # credentials. Everyone else (Home Assistant, any LAN/tailnet client) must
-# supply the read user/pass below. This both password-protects viewing AND stops
-# anyone on the LAN from hijacking the "qubo" path by publishing to it.
+# supply the read login. This both password-protects viewing AND stops anyone
+# on the LAN from hijacking the "qubo" path by publishing to it.
 #
-# NOTE: mediamtx does NOT expand ${ENV_VARS} in this file — put the credentials
-# here LITERALLY, and use the same user/pass in Home Assistant. Once filled in,
-# this file holds a password: keep it off any public remote.
+# Don't edit the placeholders: docker-compose.yml overrides this second user with
+# QUBO_RTSP_READ_USER / QUBO_RTSP_READ_PASS from the root .env. If you add a user
+# before it, update the MTX_AUTHINTERNALUSERS_1_* index in docker-compose.yml.
 authInternalUsers:
   - user: any
     ips: ['127.0.0.1', '::1']

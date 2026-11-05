@@ -60,6 +60,7 @@ A comprehensive Docker Compose setup for deploying self-hosted services on Ubunt
 │
 ├── Plex/                     # Media server
 ├── Frigate/                  # NVR for security cameras
+├── Qubo-Bridge/              # Qubo camera P2P to local RTSP
 ├── Arr-Stack/                # Media automation
 │   ├── Prowlarr/             # Indexer manager
 │   ├── Radarr/               # Movies
@@ -114,6 +115,7 @@ A comprehensive Docker Compose setup for deploying self-hosted services on Ubunt
 |---------|------|-------------|
 | **Plex** | 32400 | Media streaming server |
 | **Frigate** | 8971 | AI-powered NVR for cameras |
+| **Qubo Bridge** | 8554 | Qubo camera as a local RTSP stream (not in `setup.sh`; see its README) |
 | **Prowlarr** | 9696 | Indexer manager for *arr apps |
 | **Radarr** | 7878 | Movie collection manager |
 | **Sonarr** | 8989 | TV series collection manager |
