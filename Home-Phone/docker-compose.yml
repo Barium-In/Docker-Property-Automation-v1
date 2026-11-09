@@ -21,5 +21,13 @@ services:
       - "HOME_PHONE_TEST_CALLERS=${HOME_PHONE_TEST_CALLERS:-}"
       - "HOME_PHONE_TEST_FORWARD=${HOME_PHONE_TEST_FORWARD:-}"
       - "HOME_PHONE_TEST_MODE=${HOME_PHONE_TEST_MODE:-menu}"
+      # Test D only. Empty or unset: no ARI, exactly as stage 1. See README.
+      - "HOME_PHONE_ARI_PASSWORD=${HOME_PHONE_ARI_PASSWORD:-}"
     volumes:
       - ./logs:/var/log/asterisk
+    # Keep at most 30 MB of console log. It holds SIP traces and caller numbers.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
