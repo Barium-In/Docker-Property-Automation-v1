@@ -125,7 +125,11 @@ class FFmpeg:
 OUR_TXID = b"\x24\x4a\x21\x12" + b"bridgeP2P001"  # 16 bytes
 
 
-async def _one_session(cfg: Config, cam, mobile: str, ff: FFmpeg) -> None:
+async def _one_session(cfg: Config, cam, mobile: str, ff: FFmpeg,
+                       status: dict | None = None) -> None:
+    """Runs one P2P call until it fails; it never returns normally. Sets
+    status["video"] once authenticated video arrives, so run() can tell a call
+    that worked and then dropped from one that never got going."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", cfg.local_port))
@@ -200,6 +204,8 @@ async def _one_session(cfg: Config, cam, mobile: str, ff: FFmpeg) -> None:
                 last_media = now
                 if not got_media:
                     got_media = True
+                    if status is not None:
+                        status["video"] = True
                     log.info("media flowing (%s quality)", cfg.quality)
                 rv.push(seq, payload)
             elif pt == cfg.audio_pt and ra:
@@ -228,13 +234,17 @@ async def run(cfg: Config) -> None:
                     ff.ensure()
                     backoff = cfg.reconnect_min
                     while True:
+                        status = {"video": False}
                         try:
-                            await _one_session(cfg, cam, mobile, ff)
-                            backoff = cfg.reconnect_min
+                            await _one_session(cfg, cam, mobile, ff, status)
                         except asyncio.CancelledError:
                             raise
                         except Exception as err:  # noqa: BLE001
                             log.warning("session ended: %s", err)
+                        # A call that delivered video worked: retry fast. Only calls
+                        # that never got going back off (2, 4, 8, 16, 30 s).
+                        if status["video"]:
+                            backoff = cfg.reconnect_min
                         ff.ensure()
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, cfg.reconnect_max)
