@@ -1,0 +1,18 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Asterisk 20 from Ubuntu's archive, English prompts, envsubst for the config templates.
+# The package's sample configs are removed (all but asterisk.conf): they enable
+# things this host doesn't need, such as chan_sip on port 5060.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        asterisk asterisk-core-sounds-en-gsm gettext-base tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && find /etc/asterisk -type f ! -name asterisk.conf -delete
+
+COPY config/ /opt/home-phone/config/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

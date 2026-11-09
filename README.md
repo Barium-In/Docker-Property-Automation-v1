@@ -84,6 +84,7 @@ A comprehensive Docker Compose setup for deploying self-hosted services on Ubunt
 ├── n8n/                      # Workflow automation
 ├── Homarr/                   # Dashboard
 ├── Uptime-Kuma/              # Status monitoring
+├── Home-Phone/               # Fibre landline through Asterisk
 │
 ├── Homebridge/               # HomeKit bridge
 ├── Whisper-STT/              # Speech-to-text
@@ -109,6 +110,7 @@ A comprehensive Docker Compose setup for deploying self-hosted services on Ubunt
 | **Tailscale** | - | Mesh VPN, exit node & subnet router |
 | **NTP Server** | 123/UDP | Network time synchronization |
 | **Uptime Kuma** | 3001 | Service status monitoring |
+| **Home Phone** | 5060/UDP | Fibre landline through Asterisk (not in `setup.sh`; see its README) |
 
 ### Media & Entertainment
 | Service | Port | Description |

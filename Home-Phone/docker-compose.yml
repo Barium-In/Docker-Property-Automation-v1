@@ -1,0 +1,25 @@
+# Home Phone: the fibre landline on this host, through Asterisk.
+#
+# HOST NETWORKING is required: call audio (RTP) must reach the VM's LAN IP
+# directly, which Docker's bridge NAT would break. See README.
+#
+# Run from this folder:  docker compose --env-file ../.env up -d --build
+services:
+  asterisk:
+    build: .
+    image: home-phone-asterisk:local
+    container_name: home-phone
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=${TZ}
+      - "HOME_PHONE_SIP_DOMAIN=${HOME_PHONE_SIP_DOMAIN:?set it in the root .env}"
+      - "HOME_PHONE_SIP_PROXY=${HOME_PHONE_SIP_PROXY:?set it in the root .env}"
+      - "HOME_PHONE_SIP_NUMBER=${HOME_PHONE_SIP_NUMBER:?set it in the root .env}"
+      - "HOME_PHONE_SIP_PASSWORD=${HOME_PHONE_SIP_PASSWORD:?set it in the root .env}"
+      - "HOME_PHONE_BIND=${HOME_PHONE_BIND:-0.0.0.0}"
+      - "HOME_PHONE_TEST_CALLERS=${HOME_PHONE_TEST_CALLERS:-}"
+      - "HOME_PHONE_TEST_FORWARD=${HOME_PHONE_TEST_FORWARD:-}"
+      - "HOME_PHONE_TEST_MODE=${HOME_PHONE_TEST_MODE:-menu}"
+    volumes:
+      - ./logs:/var/log/asterisk
