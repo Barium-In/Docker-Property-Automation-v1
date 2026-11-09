@@ -41,9 +41,16 @@ Put your own mobile number in `HOME_PHONE_TEST_CALLERS` and a second family mobi
 - Works: that mobile rings, and you talk to it while Asterisk is no longer on the call.
 - Fails: you hear an error beep and the call ends.
 
-Either way, the log has a line with the result and the SIP code:
+Either way, the log has a line with the result and the SIP code (on this line, Airtel answers REFER with 405: transfer isn't allowed):
 ```bash
 docker logs home-phone 2>&1 | grep "TRANSFER RESULT"
+```
+
+**Bridge test (second call).** Call again and press 3 after the beep. Asterisk keeps your call and places a second call from the landline to the `HOME_PHONE_TEST_FORWARD` number, then joins the two. This only works if the line carries two calls at once.
+- Works: you hear that mobile ring, and once it answers you can talk to each other through Asterisk.
+- Fails: you hear an error beep. The log says why:
+```bash
+docker logs home-phone 2>&1 | grep "BRIDGE RESULT"
 ```
 
 **Deflect test (302).** Set `HOME_PHONE_TEST_MODE=deflect`, restart with `docker compose --env-file ../.env up -d`, and call. Asterisk asks the carrier to redirect the call before answering. Read the result the same way. Set it back to `menu` afterwards.
