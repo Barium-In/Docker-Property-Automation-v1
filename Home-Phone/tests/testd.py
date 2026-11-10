@@ -34,6 +34,11 @@ own re-INVITE, carried a=sendonly or a=inactive) and the leg is still held when 
 checks, the result is FAIL: that leg never had two-way audio.
 D4 sends each REFER through the [testd-refer] context in extensions.conf, which runs
 Transfer() on the channel and returns it to this script with the result.
+D4 key check (--conf, on unless --no-key-check): during the talk a snoop channel records the
+audio the conference sends to leg3, inside the container. When the talk ends the script
+downloads it into memory, deletes it in Asterisk and searches it for DTMF tones. The testers
+press 1 (test phone) and 2 (forward number) three times each, so a tone shows whose key got
+through. Keypad events on leg3 (RFC 4733) are logged as before.
 
   export HOME_PHONE_ARI_PASSWORD="$(grep '^HOME_PHONE_ARI_PASSWORD=' ../.env | cut -d= -f2-)"
   python3 tests/testd.py [--moh] [--mix | --mix-direct | --wait-in | --conf [--flash]]
@@ -48,7 +53,10 @@ Python 3 standard library only.
 import argparse
 import base64
 import hashlib
+import io
 import json
+import math
+import operator
 import os
 import re
 import select
@@ -62,6 +70,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wave
+from array import array
 
 HOST, PORT = "127.0.0.1", 8088
 APP, USER = "home-phone-testd", "homephone"
@@ -140,6 +150,50 @@ SIP_HINT = {
     38: "SIP 500", 41: "SIP 409", 58: "SIP 488/606", 102: "SIP 504",
     127: "SIP 405/481/487/491 or another 4xx/6xx",
 }
+# How a leg's end was found when ARI gave no cause for it.
+END_HOW = {
+    "poll": "found by polling: ARI sent no event for it",
+    "404": "it had gone when the script went to hang it up, and ARI sent no event for it",
+    "stasis-end": "it left the app and ARI gave no hang-up cause",
+    "hung-up": "the script hung it up, and ARI sent no event for it",
+}
+
+# D4 key check. A snoop channel on leg3 with spy=in hears the audio Airtel sends us (the
+# conference mix). res_stasis_snoop maps "in" to AST_AUDIOHOOK_DIRECTION_READ, which ast_read()
+# feeds with the frames leg3 receives. Its recording is ARI's format=wav: 8 kHz 16-bit mono.
+KEY_WAIT = 5                  # s for the snoop channel, RecordingStarted and RecordingFinished
+KEY_MAX_SECS = TALK_LIMIT + 30  # maxDurationSeconds: the recording ends by itself after this
+KEY_MAX_BYTES = 16 << 20      # the largest download accepted (330 s of 8 kHz audio is 5.3 MB)
+KEY_FOLDER = "/var/spool/asterisk/recording"
+KEY_RM = ("docker exec home-phone sh -c 'rm -f " + KEY_FOLDER + "/testd-keys-*'")
+# The DTMF detector, modelled on Asterisk's main/dsp.c dtmf_detect(). Each value is in the
+# units dsp.c uses: |X|^2 of a 102-sample block of 16-bit samples.
+DTMF_RATE = 8000
+DTMF_ROWS = (697.0, 770.0, 852.0, 941.0)
+DTMF_COLS = (1209.0, 1336.0, 1477.0, 1633.0)
+DTMF_KEYS = ("123A", "456B", "789C", "*0#D")
+DTMF_N = 102            # block length, dsp.c DTMF_GSIZE: 12.75 ms, wide enough to part the rows
+DTMF_HOP = 51           # blocks start every 6.4 ms (half overlap), so tone edges are found finely
+DTMF_FLOOR = 8.0e7      # each tone at least this (dsp.c DTMF_THRESHOLD): about -42 dBm0 per tone
+DTMF_PEAK = 6.3         # the strongest row and column 8 dB above the rest of their group (dsp.c)
+DTMF_TWIST_ROW = 6.31   # the row tone may be up to 8 dB above the column tone (dsp.c normal twist)
+DTMF_TWIST_COL = 3.98   # the column tone up to 6 dB above the row tone (dsp.c relaxed reverse
+#                         twist; the strict 4 dB is for analogue lines, and these tones may have
+#                         passed through a mobile codec and Airtel's mixer)
+DTMF_SHARE = 42.0       # row + column above 42 x the block energy: the pair carries over 82% of it
+#                         (a pure pair gives N/2 = 51; dsp.c DTMF_TO_TOTAL_ENERGY). As in dsp.c, a
+#                         pair more than about 1.5% off its frequencies is missed, which Q.24
+#                         allows a receiver; a digital tone generator is far closer than that
+DTMF_MIN_HITS = 5       # 5 matching blocks: a tone of 42 ms or more always passes, one of 31 ms
+#                         or less never does
+DTMF_GAP = 7            # 7 blocks without the digit end a press: a gap of 40 ms or more always
+#                         does and one under 20 ms never does (ES 201 235-3, cited in dsp.c)
+DTMF_DBM0 = 20 * math.log10(22300.0 * DTMF_N / 2)   # |X|^2 in dB of a 0 dBm0 tone, whose peak
+#                         is 22300 in 16-bit G.711 audio: dBm0 = 10 log10(|X|^2) - DTMF_DBM0
+_sumprod = getattr(math, "sumprod", None)      # Python 3.12 and later
+if _sumprod is None:
+    def _sumprod(a, b, _mul=operator.mul):
+        return sum(map(_mul, a, b))
 
 # A phone number: optional +91, 91 or 0, then 10 digits. Shown as the prefix, XXXXXX and the
 # last 4 digits. Digits next to a '.digit' (Asterisk channel ids) are left alone.
@@ -151,11 +205,122 @@ def redact(text):
 
 
 def cause_str(cause, text=None):
+    if cause is None:
+        return "cause unknown"
     hint = SIP_HINT.get(cause)
     out = f"cause {cause}"
     if text:
         out += f" {text}"
     return out + (f" ({hint})" if hint else "")
+
+
+# ---- D4 key check: the recording and the DTMF detector ---------------------------------------
+
+def read_wav(data):
+    """(samples, unclosed) of the WAV that ARI's record wrote with format=wav: samples is an
+    array of 16-bit ints. format_wav writes 0 in the RIFF and data sizes and fills them in only
+    when it closes the file, so a file with a 0 data size is read by its length (unclosed True).
+    ValueError when it is not a WAV the wave module reads, or not 8 kHz 16-bit mono PCM."""
+    unclosed = (len(data) > 44 and data[:4] == b"RIFF" and data[8:16] == b"WAVEfmt "
+                and data[16:20] == b"\x10\0\0\0" and data[36:40] == b"data"
+                and data[40:44] == b"\0\0\0\0")
+    if unclosed:
+        data = (data[:4] + struct.pack("<I", len(data) - 8) + data[8:40]
+                + struct.pack("<I", len(data) - 44) + data[44:])
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            shape = (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getcomptype())
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError, struct.error, ValueError) as e:
+        raise ValueError(f"the recording is not a WAV file the script can read ({e})")
+    if shape != (1, 2, DTMF_RATE, "NONE"):
+        ch, width, rate, comp = shape
+        raise ValueError(f"the recording is {rate} Hz, {8 * width}-bit, {ch} channel(s), "
+                         f"compression {comp}; the key check needs 8000 Hz 16-bit mono PCM")
+    samples = array("h")
+    samples.frombytes(frames[:len(frames) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples, unclosed
+
+
+def _dtmf_tables():
+    """cos and sin of each DTMF frequency over one block, for a DFT at exactly that frequency
+    (the same |X|^2 that dsp.c's Goertzel filters give)."""
+    out = []
+    for f in DTMF_ROWS + DTMF_COLS:
+        w = 2.0 * math.pi * f / DTMF_RATE
+        out.append(([math.cos(w * n) for n in range(DTMF_N)],
+                    [math.sin(w * n) for n in range(DTMF_N)]))
+    return out
+
+
+def find_key_tones(samples):
+    """DTMF presses in 8 kHz 16-bit audio: [(digit, start s, duration s, low tone dBm0,
+    high tone dBm0), ...]. Each level is the median over the press's blocks.
+
+    Each 102-sample block (every 51 samples) is a hit for a digit when, as in dsp.c: the
+    strongest row and the strongest column tone each reach DTMF_FLOOR, the twist is within
+    limits, each is 8 dB above the other tones of its group, and the pair holds over 82% of the
+    block's energy (speech spreads its energy over many harmonics and fails this). A press is
+    DTMF_MIN_HITS hits of the same digit or more, with gaps of fewer than DTMF_GAP blocks.
+    Blocks too quiet to hold a tone at the floor are skipped, which keeps silence cheap.
+    """
+    tables = _dtmf_tables()
+    x = array("d", samples)
+    n, size, hop, sp = len(x), DTMF_N, DTMF_HOP, _sumprod
+    quiet = DTMF_FLOOR / size           # below this block energy no tone can reach the floor
+    floor, share, peak = DTMF_FLOOR, DTMF_SHARE, DTMF_PEAK
+    twist_row, twist_col = DTMF_TWIST_ROW, DTMF_TWIST_COL
+    presses, run, misses = [], None, 0  # run: [digit, first block, last block, hits, rows, cols]
+
+    def dbm0(powers):
+        return 10 * math.log10(sorted(powers)[len(powers) // 2]) - DTMF_DBM0
+
+    def close(r):
+        if r is not None and r[3] >= DTMF_MIN_HITS:
+            presses.append((r[0], r[1] * hop / DTMF_RATE,
+                            ((r[2] - r[1]) * hop + size) / DTMF_RATE, dbm0(r[4]), dbm0(r[5])))
+
+    for i, start in enumerate(range(0, n - size + 1, hop)):
+        blk = x[start:start + size]
+        energy = sp(blk, blk)
+        hit = None
+        if energy >= quiet:
+            p = []
+            for cos_t, sin_t in tables:
+                re_, im = sp(blk, cos_t), sp(blk, sin_t)
+                p.append(re_ * re_ + im * im)
+            rows, cols = p[:4], p[4:]
+            pr, pc = max(rows), max(cols)
+            r, c = rows.index(pr), cols.index(pc)
+            if (pr >= floor and pc >= floor and pc < pr * twist_col and pr < pc * twist_row
+                    and pr + pc > share * energy
+                    and all(k == r or rows[k] * peak <= pr for k in range(4))
+                    and all(k == c or cols[k] * peak <= pc for k in range(4))):
+                hit = DTMF_KEYS[r][c]
+        if run is not None:
+            if hit == run[0]:
+                run[2], run[3], misses = i, run[3] + 1, 0
+                run[4].append(pr)
+                run[5].append(pc)
+                continue
+            misses += 1
+            if hit is not None or misses >= DTMF_GAP:
+                close(run)
+                run = None
+        if hit is not None and run is None:
+            run, misses = [hit, i, i, 1, [pr], [pc]], 0
+    close(run)
+    return presses
+
+
+def tone_summary(presses):
+    """'1 x3, 2 x3, * x1': each digit with its count, in the order it was first heard."""
+    counts = {}
+    for digit, *_ in presses:
+        counts[digit] = counts.get(digit, 0) + 1
+    return ", ".join(f"{d} x{k}" for d, k in counts.items())
 
 
 class SetupError(Exception):
@@ -175,7 +340,7 @@ class CallEnded(Exception):
 
     def __init__(self, leg, cause, text):
         super().__init__(f"{leg} ended, {cause_str(cause, text)}")
-        self.leg, self.cause, self.text = leg, cause, text
+        self.leg, self.cause, self.text = leg, cause, text   # cause None: ARI gave none
 
 
 class Log:
@@ -228,6 +393,28 @@ class Rest:
             return e.code, e.reason, {"message": message}
         except (urllib.error.URLError, OSError, ValueError) as e:
             return 0, str(getattr(e, "reason", e)), {}
+
+    def raw(self, method, path, http_timeout=30, limit=KEY_MAX_BYTES):
+        """A call whose answer is a file (GET /recordings/stored/{name}/file): (http status,
+        reason, the bytes, the Content-Type or ARI's error message). Status 0 = no answer, or
+        a file larger than `limit`. The bytes stay in memory."""
+        url = f"http://{HOST}:{PORT}/ari{path}"
+        req = urllib.request.Request(url, method=method, headers={"Authorization": self.auth})
+        try:
+            with urllib.request.urlopen(req, timeout=http_timeout) as resp:
+                data = resp.read(limit + 1)
+                if len(data) > limit:
+                    return 0, f"the file is larger than {limit >> 20} MB", b"", ""
+                return resp.status, resp.reason, data, resp.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                message = json.loads(raw).get("message", "")
+            except (ValueError, AttributeError):
+                message = raw[:200].decode("utf-8", "replace")
+            return e.code, e.reason, b"", message
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return 0, str(getattr(e, "reason", e)), b"", ""
 
 
 class Events:
@@ -428,10 +615,14 @@ class TestD:
             self.mode += "+moh"
         self.ws = None
         self.legs = {}         # "leg1" / "leg2" -> channel id
-        self.ended = {}        # label -> (cause, cause text)
+        self.ended = {}        # label -> (cause, cause text); cause None when ARI gave none
         self.ended_at = {}     # label -> time.monotonic() when it ended
+        self.end_how = {}      # label -> "destroyed", "stasis-end", "poll" or "404"
+        self.hangup_cause = {}  # label -> Q.850 cause of the carrier's hang-up request
+        self.subscribed = set()  # dialplan-entered legs the app subscribed to explicitly
         self.answered_at = None
         self.last_error = ""
+        self.last_status = 0
         self.required = set()  # legs whose end stops the current step
         self.bridge = None
         self.flag_set = False  # TESTD_WAIT may be 1
@@ -449,6 +640,9 @@ class TestD:
         self.typed = ""        # terminal input not yet used
         self.stdin_eof = False
         self.keys = []         # digits that arrived on leg3
+        self.kc = None         # the D4 key check while it runs (see key_check_start)
+        self.talk_started = False
+        self.hung_up = set()   # labels cleanup() has already hung up
 
     # ---- results -------------------------------------------------------------------------
 
@@ -463,6 +657,12 @@ class TestD:
         if self.verdict is None:
             self.verdict, self.detail = verdict, detail
 
+    def add_sentence(self, text):
+        """Add a sentence to the RESULT detail, closing the one before it."""
+        if self.detail and not self.detail.endswith("."):
+            self.detail += "."
+        self.detail = f"{self.detail} {text}" if self.detail else text
+
     # ---- ARI -----------------------------------------------------------------------------
 
     def ari(self, step, method, path, http_timeout=10, body=None, **params):
@@ -475,6 +675,7 @@ class TestD:
             shown = shown.replace(self.bridge, "bridge")
         ok = 200 <= status < 300
         note = "" if ok or not body.get("message") else f" ({body['message']})"
+        self.last_status = status
         self.last_error = "" if ok else f"HTTP {status or 'no answer'} {reason}{note}"
         self.log(f"{step}: {method} {shown} -> {status or 'no answer'} {reason}{note}")
         return ok, body
@@ -508,8 +709,38 @@ class TestD:
     def end_str(self, label):
         cause, text = self.ended[label]
         if cause is None:
-            return f"{label} ended (found by polling: ARI sends no events while it runs a REFER)"
+            return f"{label} ended ({END_HOW.get(self.end_how.get(label), 'ARI gave no cause')})"
         return f"{label} ended, {cause_str(cause, text)}"
+
+    def mark_ended(self, label, cause, text, how):
+        """Record that a leg has ended. The first sign sets the time; ChannelDestroyed, which
+        carries the channel's own cause, replaces a cause found another way. A leg the current
+        step depends on raises CallEnded."""
+        first = label not in self.ended
+        if first or how == "destroyed":
+            self.ended[label] = (cause, text)
+            self.end_how[label] = how
+        if first:
+            self.ended_at[label] = time.monotonic()
+        self.outside.discard(label)
+        if label in self.required:
+            self.required.discard(label)
+            cause, text = self.ended[label]
+            raise CallEnded(label, cause, text)
+
+    def subscribe(self, label):
+        """Subscribe the app to a leg that entered through the dialplan. In 20.6 StasisEnd
+        unsubscribes the app from such a channel (res_stasis app_send_end_msg), so its
+        ChannelDestroyed never arrives; an ARI-originated channel keeps the subscription the
+        originate made (resource_channels.c), which is why leg2 and leg3 always report theirs."""
+        ok, _ = self.ari(f"setup: subscribe the app to {label}, so ARI reports its end after it "
+                         "leaves the app", "POST", f"/applications/{APP}/subscription",
+                         eventSource=f"channel:{self.legs[label]}")
+        if ok:
+            self.subscribed.add(label)
+        else:
+            self.log(f"note: no subscription for {label}: the script learns of its end from "
+                     "StasisEnd, and by polling while it runs a REFER")
 
     def label_of(self, cid):
         for label, x in self.legs.items():
@@ -524,8 +755,9 @@ class TestD:
         kind = ev.get("type", "?")
         ch = channel_of(ev)
         label = self.label_of(ch.get("id"))
-        if label is None and kind.startswith("Playback"):
-            target = ev.get("playback", {}).get("target_uri", "")
+        if label is None and kind.startswith(("Playback", "Recording")):
+            target = ev.get("playback" if kind.startswith("Playback") else "recording",
+                            {}).get("target_uri", "")
             label = ("bridge" if self.bridge and target == f"bridge:{self.bridge}"
                      else self.label_of(target.partition(":")[2]))
         if label is None:
@@ -540,9 +772,21 @@ class TestD:
                 bits.append(f"{key}={ev[key]}")
         if kind.startswith("Playback"):
             bits.append(ev.get("playback", {}).get("media_uri", ""))
-        if "cause" in ev:
+        rec = ev.get("recording") if kind.startswith("Recording") else None
+        if isinstance(rec, dict):
+            bits.append(f"{rec.get('name', '')} {rec.get('state', '')}")
+            if rec.get("cause"):
+                bits.append(f"({rec['cause']})")
+        if kind == "ChannelHangupRequest" and ev.get("soft"):
+            bits.append("(a soft hang-up, such as the script's own)")
+        elif "cause" in ev:
             bits.append(cause_str(ev.get("cause"), ev.get("cause_txt")))
         self.log(" ".join(str(b) for b in bits))
+        kc = self.kc
+        if isinstance(rec, dict) and kc and rec.get("name") == kc["name"]:
+            kc["state"] = str(rec.get("state", ""))
+            if kind == "RecordingFailed":
+                kc["fail_cause"] = str(rec.get("cause") or "no cause given")
         # Asterisk raises ChannelHold only for a hold from the far end (ast_queue_hold); the
         # script's own holds raise none. So this is the carrier holding the leg.
         if kind == "ChannelHold" and label in self.legs:
@@ -553,15 +797,28 @@ class TestD:
             self.net_held.discard(label)
             self.log(f"note: the carrier took {label} off hold from its side")
         elif kind == "StasisStart" and label in self.outside:
-            self.outside.discard(label)      # back from [testd-refer]: events flow again
+            self.outside.discard(label)      # back from [testd-refer]
         elif kind == "Dial" and ev.get("dialstatus") == "PROGRESS" and label in self.legs:
             self.progress.add(label)
-        if kind == "ChannelDestroyed" and label in self.legs:
-            self.ended[label] = (ev.get("cause"), ev.get("cause_txt"))
-            self.ended_at[label] = time.monotonic()
-            if label in self.required:
-                self.required.discard(label)
-                raise CallEnded(label, ev.get("cause"), ev.get("cause_txt"))
+        elif kind == "ChannelDtmfReceived" and label == "leg3":
+            # Counted here, so a key that arrives during a playback or the key-check setup
+            # counts too. ask() handles * and # in the talk.
+            self.keys.append(str(ev.get("digit")))
+            self.dtmf_from.add("leg3")
+        elif (kind == "ChannelHangupRequest" and label in self.legs and not ev.get("soft")
+              and isinstance(ev.get("cause"), int) and ev["cause"] > 0):
+            # The carrier's hang-up (ast_queue_hangup_with_cause) carries a Q.850 cause. A
+            # soft one (ast_softhangup, as for ARI's DELETE) carries a flag in that field.
+            self.hangup_cause[label] = ev["cause"]
+        if label not in self.legs:
+            return
+        if kind == "StasisEnd" and label not in self.outside and label not in self.ended:
+            # The script sent this leg nowhere (a continue into [testd-refer] puts it in
+            # self.outside first, and send_back() only takes unlabelled calls), so it has
+            # hung up. A dialplan-entered leg sends nothing after this unless subscribed.
+            self.mark_ended(label, self.hangup_cause.get(label), None, "stasis-end")
+        elif kind == "ChannelDestroyed":
+            self.mark_ended(label, ev.get("cause"), ev.get("cause_txt"), "destroyed")
 
     def wait_for(self, timeout, match=None):
         """Handle events until match(event) is true (returns it) or `timeout` s pass (None).
@@ -620,37 +877,44 @@ class TestD:
             self.wait_for(wait, lambda e: e.get("type") == "PlaybackFinished"
                           and e.get("playback", {}).get("id") == pid)
 
-    def hangup(self, step, label):
-        """Hang up a leg. True if this hang-up ended it, False if it had already gone."""
+    def hangup(self, step, label, wait=5.0):
+        """Hang up a leg and wait up to `wait` s for its end. True if this hang-up ended it,
+        False if it had already gone."""
         cid = self.legs.get(label)
         if not cid or label in self.ended:
             return False
         self.required.discard(label)
         ok, _ = self.ari(step, "DELETE", f"/channels/{cid}", reason="normal")
-        if label in self.outside:
-            # A leg inside [testd-refer] sends no events: look until it has gone.
-            end = time.monotonic() + 5
-            while label not in self.ended and time.monotonic() < end:
-                self.wait_for(0.5)
+        if self.last_status == 404 and label not in self.ended:
+            self.mark_ended(label, None, None, "404")
+            self.log(f"{label} had already gone (DELETE -> 404), and ARI had sent no event for "
+                     "its end")
+            return False
+        end = time.monotonic() + wait
+        while label not in self.ended:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            if label in self.outside:
+                # A dialplan-entered leg inside [testd-refer] may send no events: look as well.
+                self.wait_for(min(0.5, left), lambda e: label in self.ended)
                 self.poll_outside()
-            return ok
-        self.wait_for(5, lambda e: e.get("type") == "ChannelDestroyed"
-                      and self.label_of(channel_of(e).get("id")) == label)
+            else:
+                self.wait_for(left, lambda e: label in self.ended)
         return ok
 
     def poll_outside(self):
-        """Find legs that ended while they ran a REFER. In 20.6 the app gets no events for a
-        channel after its StasisEnd (res_stasis unsubscribes it), so ask for each one."""
+        """Find legs that ended while they ran a REFER. In 20.6 StasisEnd unsubscribes the app
+        from a dialplan-entered channel (res_stasis app_send_end_msg), so unless subscribe()
+        worked such a leg sends no events in [testd-refer]: ask for each one."""
         for label in list(self.outside):
             if label in self.ended:
                 self.outside.discard(label)
                 continue
             status, _, _ = self.rest.call("GET", f"/channels/{self.legs[label]}", http_timeout=5)
-            if status == 404:
-                self.outside.discard(label)
+            if status == 404 and label not in self.ended:
                 self.required.discard(label)
-                self.ended[label] = (None, None)
-                self.ended_at[label] = time.monotonic()
+                self.mark_ended(label, None, None, "poll")
                 self.log(f"{label} has gone (GET /channels -> 404). It ended while it ran the "
                          "REFER, so ARI sent no event and the cause is not known; see the trace.")
 
@@ -743,11 +1007,12 @@ class TestD:
                          "questions there; with no answer the result is UNCLEAR.")
         self.log(f"ready for {self.mode}. Call the landline from a test number and press 4 "
                  "after the beep. Ctrl-C stops.")
-        ev = self.wait_for(None, lambda e: e.get("type") == "StasisStart"
-                           and first_arg(e) not in ("second", "incoming", "focus", "referred"))
+        ev = self.wait_for(None, lambda e: e.get("type") == "StasisStart" and first_arg(e)
+                           not in ("second", "incoming", "focus", "referred", "keycheck"))
         self.legs["leg1"] = channel_of(ev)["id"]
         self.required = {"leg1"}
         forward = first_arg(ev)
+        self.subscribe("leg1")
         self.step = "D1a hold leg1"
         if not self.opt.wait_in and not re.fullmatch(r"\+?\d{6,15}", forward):
             self.fail("no usable forward number came from the dialplan. "
@@ -779,14 +1044,14 @@ class TestD:
             self.fail("D1b: Asterisk refused the originate (see the ARI line above)")
             self.return_caller(failed=True)
             return
-        ev = self.wait_for(RING_TIMEOUT + 15, lambda e: e.get("type") in (
-            "StasisStart", "ChannelDestroyed") and self.label_of(channel_of(e).get("id")) == "leg2")
+        ev = self.wait_for(RING_TIMEOUT + 15, lambda e: "leg2" in self.ended or (
+            e.get("type") == "StasisStart" and self.label_of(channel_of(e).get("id")) == "leg2"))
         if ev is None:
             self.fail(f"D1b: the second call neither answered nor ended in {RING_TIMEOUT + 15} s")
             self.hangup("D1b give up on leg2", "leg2")
             self.return_caller(failed=True)
             return
-        if ev["type"] == "ChannelDestroyed":
+        if "leg2" in self.ended:
             self.fail("D1b: the second call failed, " + cause_str(*self.ended["leg2"]))
             self.return_caller(failed=True)
             return
@@ -855,6 +1120,7 @@ class TestD:
             return
         self.legs["leg2"] = channel_of(ev)["id"]
         self.log("E2: a call in arrived while leg1 was held")
+        self.subscribe("leg2")
         self.step = "E2 answer leg2"
         ok, _ = self.ari("E2: answer leg2", "POST", f"/channels/{self.legs['leg2']}/answer")
         if not ok:
@@ -1083,12 +1349,12 @@ class TestD:
             error = self.last_error
             del self.legs[label]
             return "refused", error
-        ev = self.wait_for(FOCUS_RING + 10, lambda e: e.get("type") in (
-            "StasisStart", "ChannelDestroyed") and self.label_of(channel_of(e).get("id")) == label)
+        ev = self.wait_for(FOCUS_RING + 10, lambda e: label in self.ended or (
+            e.get("type") == "StasisStart" and self.label_of(channel_of(e).get("id")) == label))
         if ev is None:
             self.hangup(f"{step}: give up on {label}", label)
             return "timeout", None
-        if ev["type"] == "ChannelDestroyed":
+        if label in self.ended:
             return "failed", self.ended[label]
         return "answered", None
 
@@ -1109,42 +1375,56 @@ class TestD:
         if not ok:
             return out
         start = time.monotonic()
-        # By label: ARI checks a label exists (404 if not), and does not check a priority. An
-        # image built before [testd-refer] then stops here with nothing sent.
-        ok, _ = self.ari(f"{step}: send the REFER inside {on}'s dialog ({on} runs testd-refer)",
-                         "POST", f"/channels/{cid}/continue", context="testd-refer",
-                         extension="s", label="refer")
-        if not ok:
-            out["error"] = self.last_error
-            return out
+        # Its StasisEnd on the way to [testd-refer] is not an end, and while it runs the REFER
+        # its end is a result (ENDED or GONE) for this step, so it is not required meanwhile.
         self.outside.add(on)
-        end = start + REFER_WAIT
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                out.update(status="TIMEOUT", secs=float(REFER_WAIT), at=time.monotonic())
-                self.log(f"{step}: no REFER result in {REFER_WAIT} s")
+        required = on in self.required
+        self.required.discard(on)
+        try:
+            # By label: ARI checks a label exists (404 if not), and does not check a priority.
+            # An image built before [testd-refer] then stops here with nothing sent.
+            ok, _ = self.ari(f"{step}: send the REFER inside {on}'s dialog ({on} runs "
+                             "testd-refer)", "POST", f"/channels/{cid}/continue",
+                             context="testd-refer", extension="s", label="refer")
+            if not ok:
+                if self.last_status:            # refused, so it never left the app
+                    self.outside.discard(on)
+                out["error"] = self.last_error
                 return out
-            ev = self.wait_for(min(1.0, left), lambda e: e.get("type") == "StasisStart"
-                               and channel_of(e).get("id") == cid and first_arg(e) == "referred")
-            now = time.monotonic()
-            if ev is not None:
-                args = [str(a) for a in (ev.get("args") or [])] + ["", "", ""]
-                status = args[1] or "?"
-                code = int(args[2]) if re.fullmatch(r"-?\d+", args[2]) else None
-                out.update(status=status, code=code, secs=now - start, at=now)
-                note = ""
-                if status == "SUCCESS" and moved and now - start > 4:
-                    note = ": the focus probably rang the phone afresh"
-                elif status == "FAILURE":
-                    note = f" ({REFER_HINT.get(code, 'see the NOTIFY sipfrag in the trace')})"
-                self.log(f"{step}: {on} is back with {status} {code} after "
-                         f"{now - start:.1f} s{note}")
-                return out
-            self.poll_outside()
-            if on in self.ended:
-                out.update(status="ENDED" if on == moved else "GONE", secs=now - start, at=now)
-                return out
+            end = start + REFER_WAIT
+
+            def back(e):
+                return (e.get("type") == "StasisStart" and channel_of(e).get("id") == cid
+                        and first_arg(e) == "referred")
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    out.update(status="TIMEOUT", secs=float(REFER_WAIT), at=time.monotonic())
+                    self.log(f"{step}: no REFER result in {REFER_WAIT} s")
+                    return out
+                ev = self.wait_for(min(1.0, left), lambda e: back(e) or on in self.ended)
+                now = time.monotonic()
+                if ev is not None and back(ev):
+                    args = [str(a) for a in (ev.get("args") or [])] + ["", "", ""]
+                    status = args[1] or "?"
+                    code = int(args[2]) if re.fullmatch(r"-?\d+", args[2]) else None
+                    out.update(status=status, code=code, secs=now - start, at=now)
+                    note = ""
+                    if status == "SUCCESS" and moved and now - start > 4:
+                        note = ": the focus probably rang the phone afresh"
+                    elif status == "FAILURE":
+                        note = f" ({REFER_HINT.get(code, 'see the NOTIFY sipfrag in the trace')})"
+                    self.log(f"{step}: {on} is back with {status} {code} after "
+                             f"{now - start:.1f} s{note}")
+                    return out
+                self.poll_outside()
+                if on in self.ended:
+                    out.update(status="ENDED" if on == moved else "GONE", secs=now - start,
+                               at=now)
+                    return out
+        finally:
+            if required and on not in self.ended:
+                self.required.add(on)
 
     def refer_targets(self, party, d, dropped, focus, forward):
         """([(variant, Refer-To), ...], the leg the REFER goes in, the leg expected to end)."""
@@ -1229,8 +1509,10 @@ class TestD:
                          "--env-file ../.env up -d --build) and check dialplan show testd-refer.")
             return text, "STOPPED"
         if status == "GONE":
+            cause = self.ended[on][0]
             return (f"D4: leg3 has gone during the REFER for {party} ({name}): the focus dropped "
-                    "us", "FAIL")
+                    "us" + (f", {cause_str(*self.ended[on])}" if cause is not None else ""),
+                    "FAIL")
         if status == "TIMEOUT":
             text = (f"D4: no REFER result for {party} ({name}) in {REFER_WAIT} s. The focus took "
                     "the REFER but sent no final NOTIFY, or it follows RFC 4488 without "
@@ -1265,8 +1547,8 @@ class TestD:
             self.log(f"D4: {party} ended after its REFER (no NOTIFY; see the 202 in the trace)")
             return f"{party} ({name}): {party} ended {secs:.1f} s after its REFER"
         if moved not in self.ended:
-            self.wait_for(BYE_WAIT, lambda e: e.get("type") == "ChannelDestroyed"
-                          and self.label_of(channel_of(e).get("id")) == moved)
+            # StasisEnd or ChannelDestroyed, whichever ARI sends (note() marks either).
+            self.wait_for(BYE_WAIT, lambda e: moved in self.ended)
         if moved in self.ended:
             gap = self.ended_at[moved] - result["at"]
             when = (f"{gap:.1f} s after the result" if gap >= 0
@@ -1274,9 +1556,15 @@ class TestD:
             self.log(f"D4: {self.end_str(moved)}: Airtel replaced {moved} {when}")
             return f"{party} ({name}): SUCCESS after {secs:.1f} s, Airtel ended {party} {when}"
         self.log(f"D4: Airtel did not end {moved} within {BYE_WAIT} s of the result")
-        self.hangup(f"D4: release {moved} after the NOTIFY 200 (TS 24.147 5.3.1.3.3)", moved)
-        return (f"{party} ({name}): SUCCESS after {secs:.1f} s; Airtel did not end {party}, so "
-                "the script released it")
+        if self.hangup(f"D4: release {moved} after the NOTIFY 200 (TS 24.147 5.3.1.3.3)", moved):
+            return (f"{party} ({name}): SUCCESS after {secs:.1f} s; Airtel did not end {party}, "
+                    "so the script released it")
+        if self.end_how.get(moved) == "404":
+            return (f"{party} ({name}): SUCCESS after {secs:.1f} s; ARI showed no end of {party} "
+                    f"within {BYE_WAIT} s, and it had gone when the script went to release it "
+                    "(see the trace for its BYE)")
+        return (f"{party} ({name}): SUCCESS after {secs:.1f} s; Airtel did not end {party}, and "
+                f"the script could not release it ({self.last_error})")
 
     def recover(self):
         """After a D4 failure: leave the conference, drop leg2, and give the caller back."""
@@ -1341,8 +1629,6 @@ class TestD:
             if ev is None:
                 continue
             digit = str(ev.get("digit"))
-            self.keys.append(digit)
-            self.dtmf_from.add("leg3")
             if digit == "*" and "leg3" not in self.ended:
                 self.play("D4: * on leg3, beep into the conference", "leg3", "beep", wait=0)
             elif digit == "#" and talk:
@@ -1404,8 +1690,10 @@ class TestD:
                 self.wait_for(PROBE_GAP)
         if found:
             first = found[0].split(" ", 1)[0]
-            run = f"--conf --conf-uri '{first}'" + (" --icsi" if self.opt.icsi else "")
-            self.passed(f"a conference focus answered: {', '.join(found)}. Run D4 with {run}."
+            self.passed(f"a conference focus answered: {', '.join(found)}. Run D4 with --conf "
+                        f"--conf-uri '{first}'."
+                        + (" This probe used --icsi; leave it out of D4 if a probe without "
+                           "--icsi found the same focus." if self.opt.icsi else "")
                         + (f" Also answered without ;isfocus: {', '.join(unclear)}." if unclear
                            else ""))
         elif unclear:
@@ -1559,21 +1847,33 @@ class TestD:
             self.recover()
             return
         played = self.play("D4: play hello-world to leg3", "leg3", "hello-world")
-        if flash:
-            self.log("D4 flash: leg3 is up. If Airtel joined the three calls, both phones heard "
-                     "hello-world and can hear each other. Talk on both phones. * beeps and # "
-                     "ends, only if keys reach leg3. Press Enter here when done, or type n if "
-                     "either could not hear the other. The script cannot hear the call.")
-        else:
-            self.log("D4: conference up. Talk on both phones. * beeps into the conference and "
-                     "# ends, only if keys pass through Airtel's conference. Press Enter here "
-                     "when done, or type n if either could not hear the other. The script "
-                     "cannot hear the call.")
-        self.step = "D4 talk"
-        start = time.monotonic()
-        said = self.ask(None, limit=TALK_LIMIT, talk=True)
+        self.talk_started = True
+        try:
+            self.key_check_start()
+            keys = ("Then the key check, with both phones quiet while keys are pressed: press 1 "
+                    "three times on the test phone, about a second apart, then say \"now\", and "
+                    "the forward-number owner presses 2 three times the same way. Then press * "
+                    "and then # on the test phone. * beeps into the conference and # ends the "
+                    "talk, only if keys reach the script as keypad events. Press Enter here when "
+                    "done, or type n if either could not hear the other.")
+            kc = self.kc
+            if kc and kc["requested"] and not kc["error"]:
+                keys += (" The conference audio is recorded for the key check until the talk "
+                         "ends, and the script then deletes it.")
+            if flash:
+                self.log("D4 flash: leg3 is up. If Airtel joined the three calls, both phones "
+                         "heard hello-world and can hear each other. Talk on both phones. " + keys)
+            else:
+                self.log("D4: conference up. Talk on both phones. " + keys)
+            self.step = "D4 talk"
+            start = time.monotonic()
+            said = self.ask(None, limit=TALK_LIMIT, talk=True)
+        except CallEnded:
+            self.key_check_end()
+            raise
         talk = int(time.monotonic() - start)
         self.required.discard("leg3")           # from here its end is reported, not a failure
+        self.key_check_end()
         if said is not None and said.startswith("n"):
             heard = "n"
         else:
@@ -1631,8 +1931,7 @@ class TestD:
                  "both phones, or press Ctrl-C here to leave it.")
         start = time.monotonic()
         try:
-            ev = self.wait_for(TALK_LIMIT, lambda e: e.get("type") == "ChannelDestroyed"
-                               and self.label_of(channel_of(e).get("id")) == "leg3")
+            ev = self.wait_for(TALK_LIMIT, lambda e: "leg3" in self.ended)
             how = ("Airtel ended leg3, " + cause_str(*self.ended["leg3"]) if ev is not None
                    else f"the {TALK_LIMIT} s limit")
         except KeyboardInterrupt:
@@ -1641,6 +1940,241 @@ class TestD:
         self.log(f"D4 --no-drop: left the conference after {secs} s ({how})")
         self.detail += f" With --no-drop the script stayed on the conference {secs} s, until {how}."
 
+    # ---- Test D4: the key check -----------------------------------------------------------
+
+    def key_check_start(self):
+        """Once the conference is up: a snoop channel on leg3 with spy=in (what Airtel sends
+        us) and a recording of it. ARI's record runs as a command on the channel's control and
+        holds it until the recording ends (res_stasis_recording record_file), so recording
+        leg3 itself would hold back the beep for *; the snoop channel takes that wait. A failed
+        step is logged and leaves kc['error']; the test goes on without the check."""
+        if self.opt.no_key_check:
+            self.log("D4 key check: off (--no-key-check)")
+            return
+        # The dash keeps 10 digits from running together, which the log's redaction would mask.
+        tag = uuid.uuid4().hex[:6] + "-" + uuid.uuid4().hex[:6]
+        # requested: a record request went out, so a file may exist; started: ARI accepted it;
+        # gone: no file is left in the container.
+        kc = self.kc = {"name": f"testd-keys-{tag}", "error": "", "state": "", "fail_cause": "",
+                        "requested": False, "started": False, "gone": False, "ended": False,
+                        "presses": None, "secs": 0.0}
+        step = self.step
+        self.step = "D4 key check setup"
+        try:
+            # Known before the request, so its events get the label and send_back() skips it.
+            self.legs["snoop"] = f"testd-snoop-{tag}"
+            ok, _ = self.ari("D4 key check: snoop on leg3 (spy=in: the audio Airtel sends us)",
+                             "POST", f"/channels/{self.legs['leg3']}/snoop", spy="in",
+                             whisper="none", app=APP, appArgs="keycheck",
+                             snoopId=self.legs["snoop"])
+            if not ok:
+                if self.last_status:            # refused, so no snoop channel exists
+                    del self.legs["snoop"]
+                kc["error"] = f"Asterisk would not create the snoop channel ({self.last_error})"
+                self.log(f"D4 key check did not start: {kc['error']}")
+                return
+            ev = self.wait_for(KEY_WAIT, lambda e: "snoop" in self.ended or (
+                e.get("type") == "StasisStart"
+                and self.label_of(channel_of(e).get("id")) == "snoop"))
+            if ev is None or "snoop" in self.ended:
+                kc["error"] = f"the snoop channel did not enter the app within {KEY_WAIT} s"
+                self.log(f"D4 key check did not start: {kc['error']}")
+                # Outside the app it sends no events, so the DELETE's answer is the only sign.
+                if (self.hangup("D4 key check: hang up the snoop channel", "snoop", wait=1.0)
+                        and "snoop" not in self.ended):
+                    self.mark_ended("snoop", None, None, "hung-up")
+                return
+            kc["requested"] = True              # from here a file may exist: cleanup deletes it
+            ok, _ = self.ari("D4 key check: record the snoop channel", "POST",
+                             f"/channels/{self.legs['snoop']}/record", name=kc["name"],
+                             format="wav", maxDurationSeconds=KEY_MAX_SECS, ifExists="overwrite",
+                             beep="false", terminateOn="none")
+            if not ok:
+                kc["error"] = f"Asterisk refused the recording ({self.last_error})"
+                if self.last_status == 500:
+                    kc["error"] += (f". A missing {KEY_FOLDER} gives this: recreate the "
+                                    "container from docker-compose.yml, which mounts it (see "
+                                    "Set up D4 in the README)")
+                self.log(f"D4 key check did not start: {kc['error']}")
+                self.hangup("D4 key check: hang up the snoop channel", "snoop")
+                return
+            kc["started"] = True
+            # Wait for RecordingStarted: a stop while the recording is still queued is ignored
+            # in 20.6 (recording_disregard), and the recording would then run on.
+            self.wait_for(KEY_WAIT, lambda e: kc["state"] not in ("", "queued")
+                          or "snoop" in self.ended)
+            if kc["state"] == "failed":
+                kc["error"] = f"Asterisk could not record ({kc['fail_cause']})"
+                self.log(f"D4 key check did not start: {kc['error']}")
+            elif kc["state"] != "recording":
+                self.log(f"D4 key check: no RecordingStarted within {KEY_WAIT} s; carrying on")
+            else:
+                self.log(f"D4 key check: recording {kc['name']} in the container")
+        finally:
+            self.step = step
+
+    def key_check_end(self):
+        """When the talk ends: stop the recording, hang up the snoop channel, download the file
+        into memory, delete it in Asterisk, then look for key tones. Failures are logged and
+        leave kc['error']; the test goes on."""
+        kc = self.kc
+        if kc is None or kc["ended"]:
+            return
+        kc["ended"] = True
+        step = self.step
+        self.step = "D4 key check"
+        try:
+            name = kc["name"]
+            over = ("done", "failed", "canceled")
+            if kc["started"] and kc["state"] not in over:
+                # 404: it had already finished, as when leg3 ended and took the snoop with it.
+                self.ari("D4 key check: stop the recording", "POST",
+                         f"/recordings/live/{name}/stop")
+                if kc["state"] not in over and "snoop" not in self.ended:
+                    self.wait_for(KEY_WAIT, lambda e: kc["state"] in over
+                                  or "snoop" in self.ended)
+            if "snoop" in self.legs:
+                self.hangup("D4 key check: hang up the snoop channel", "snoop")
+            if not kc["requested"]:
+                return
+            self.key_check_settle(lambda s: self.wait_for(s))
+            data = None
+            if kc["state"] == "failed":
+                kc["error"] = kc["error"] or f"Asterisk could not record ({kc['fail_cause']})"
+                self.log(f"D4 key check: {kc['error']}")
+            elif not kc["error"]:
+                data = self.key_check_fetch()
+            self.key_check_delete("D4 key check")
+            if data is not None:
+                self.key_check_analyse(data)
+        finally:
+            self.step = step
+
+    def key_check_settle(self, sleep):
+        """Wait (up to KEY_WAIT s) until ARI no longer lists the live recording, so the file is
+        closed before it is read or deleted. Polls ARI, so it works without events too."""
+        end = time.monotonic() + KEY_WAIT
+        while time.monotonic() < end:
+            status, _, _ = self.rest.call("GET", f"/recordings/live/{self.kc['name']}",
+                                          http_timeout=3)
+            if status != 200:
+                return
+            sleep(0.2)
+        self.log(f"D4 key check: the recording was still live after {KEY_WAIT} s")
+
+    def key_check_fetch(self):
+        """The recording's bytes (kept in memory only), or None with kc['error'] set."""
+        kc = self.kc
+        path = f"/recordings/stored/{kc['name']}/file"
+        status, reason, data, info = self.rest.raw("GET", path)
+        got = (f"{len(data)} bytes, {info or 'no Content-Type'}" if status == 200
+               else (info or reason))
+        self.log(f"D4 key check: download: GET {path} -> {status or 'no answer'} {reason} ({got})")
+        if status == 200 and data:
+            return data
+        if status == 404:
+            kc["error"] = "Asterisk stored no recording file (HTTP 404)"
+        elif status == 200:
+            kc["error"] = "the recording file was empty"
+        else:
+            kc["error"] = (f"the recording could not be downloaded (HTTP {status or 'no answer'} "
+                           f"{reason}{': ' + info if info else ''})")
+        self.log(f"D4 key check: {kc['error']}")
+        return None
+
+    def key_check_delete(self, prefix):
+        """Delete the stored recording through ARI and log the result."""
+        kc = self.kc
+        name = kc["name"]
+        ok, _ = self.ari(f"{prefix}: delete the recording", "DELETE", f"/recordings/stored/{name}",
+                         http_timeout=5)
+        if ok:
+            kc["gone"] = True
+            self.log(f"{prefix}: deleted the recording {name} in Asterisk")
+        elif self.last_status == 404:
+            kc["gone"] = True
+            self.log(f"{prefix}: Asterisk holds no recording {name}, so there is nothing to delete")
+        else:
+            self.log(f"{prefix}: could not delete the recording {name} ({self.last_error}). "
+                     f"Remove it by hand: {KEY_RM}")
+
+    def key_check_analyse(self, data):
+        """Read the WAV in memory and look for DTMF tones in it."""
+        kc = self.kc
+        try:
+            samples, unclosed = read_wav(data)
+            del data
+            secs = len(samples) / DTMF_RATE
+            if unclosed:
+                self.log(f"D4 key check: the WAV header has no sizes (Asterisk had not closed the "
+                         f"file), so the {secs:.0f} s after it are read as the audio")
+            loudest = max(map(abs, samples)) if samples else 0
+            if secs < 2:
+                raise ValueError(f"the recording holds only {secs:.1f} s of audio")
+            if loudest == 0:
+                raise ValueError(f"the {secs:.0f} s recording is digital silence: no audio "
+                                 "reached leg3 from the conference")
+            self.log(f"D4 key check: looking for key tones in {secs:.0f} s of conference audio")
+            began = time.monotonic()
+            presses = find_key_tones(samples)
+        except ValueError as e:
+            kc["error"] = str(e)
+            self.log(f"D4 key check: {e}")
+            return
+        except Exception as e:                  # a bug here must not stop the test
+            kc["error"] = f"the tone search failed ({e!r})"
+            self.log(f"D4 key check: {kc['error']}")
+            return
+        kc["secs"], kc["presses"] = secs, presses
+        for digit, at, dur, low, high in presses:
+            self.log(f"D4 key check: tone {digit} at {at:.2f} s, {dur * 1000:.0f} ms, low tone "
+                     f"{low:.0f} dBm0, high tone {high:.0f} dBm0")
+        found = (f"{len(presses)} key tone(s): {tone_summary(presses)}" if presses
+                 else "no key tones")
+        self.log(f"D4 key check: {found} in {secs:.0f} s of conference audio (searched in "
+                 f"{time.monotonic() - began:.1f} s)")
+
+    def key_check_cleanup(self):
+        """cleanup(): if the run stopped before key_check_end() finished, stop the recording,
+        hang up the snoop channel and delete the file. REST only, so it works after the event
+        connection has gone."""
+        kc = self.kc
+        if kc is None or not kc["requested"] or kc["gone"]:
+            return
+        if kc["started"] and kc["state"] not in ("done", "failed", "canceled"):
+            self.ari("cleanup: stop the key-check recording", "POST",
+                     f"/recordings/live/{kc['name']}/stop", http_timeout=3)
+        if "snoop" in self.legs and "snoop" not in self.ended:
+            self.ari("cleanup: hang up the snoop channel", "DELETE",
+                     f"/channels/{self.legs['snoop']}", reason="normal", http_timeout=3)
+            self.hung_up.add("snoop")
+        self.key_check_settle(time.sleep)
+        self.key_check_delete("cleanup")
+
+    def key_check_text(self):
+        """The key check's sentence for the RESULT line ('' when it was never due)."""
+        kc = self.kc
+        events = (f"keypad events on leg3: {' '.join(self.keys)}" if self.keys
+                  else "no keypad events on leg3")
+        if kc is None:
+            return ("Key check: off (--no-key-check); " + events + "."
+                    if self.opt.no_key_check and self.talk_started else "")
+        if kc["error"]:
+            text = f"Key check did not run: {kc['error']}; {events}."
+        elif kc["presses"] is None:
+            text = f"Key check: not analysed, the run stopped first; {events}."
+        elif kc["presses"]:
+            text = (f"Key check: {events}; in-band tones in the conference audio: "
+                    f"{tone_summary(kc['presses'])}.")
+        elif self.keys:
+            text = f"Key check: {events}; no key tones in {kc['secs']:.0f} s of conference audio."
+        else:
+            text = (f"Key check: no keypad events and no key tones in {kc['secs']:.0f} s of "
+                    "conference audio: key presses stop at Airtel's conference.")
+        if kc["requested"] and not kc["gone"]:
+            text += (f" The recording {kc['name']} may still be in the container: {KEY_RM}")
+        return text
+
     # ---- start and finish ----------------------------------------------------------------
 
     def cleanup(self):
@@ -1648,12 +2182,16 @@ class TestD:
         [testd-refer] hangs up too, since ARI hangup needs no Stasis), close the websocket."""
         if self.flag_set:
             self.set_flag("0", "cleanup: clear TESTD_WAIT")
+        try:
+            self.key_check_cleanup()
+        except Exception as e:      # the calls below must still be hung up
+            self.log(f"cleanup error in the key check: {e!r}. If a recording is left: {KEY_RM}")
         if self.bridge:
             self.ari("cleanup: destroy the bridge", "DELETE", f"/bridges/{self.bridge}",
                      http_timeout=3)
         for label in reversed(list(self.legs)):
             cid = self.legs.get(label)
-            if cid and label not in self.ended:
+            if cid and label not in self.ended and label not in self.hung_up:
                 self.ari(f"cleanup: hang up {label}", "DELETE", f"/channels/{cid}",
                          reason="normal", http_timeout=3)
         if self.ws:
@@ -1693,11 +2231,16 @@ class TestD:
                 self.verdict, self.detail = "STOPPED", f"no result reached ({self.step})"
             if self.verdict in ("PASS", "FAIL", "UNCLEAR"):
                 if self.opt.conf:
-                    self.detail += (" The script cannot hear the call: the audio verdict is "
-                                    "the testers'.")
+                    self.add_sentence("The script does not judge voices: the audio verdict is "
+                                      "the testers'.")
                 elif self.opt.probe and self.verdict != "FAIL":
-                    self.detail += (" A 200 OK shows signalling only: D4 tests whether a "
-                                    "conference carries audio.")
+                    self.add_sentence("A 200 OK shows signalling only: D4 tests whether a "
+                                      "conference carries audio.")
+            if self.opt.conf:
+                # The key check never changes the verdict; it only adds its own sentence.
+                text = self.key_check_text()
+                if text:
+                    self.add_sentence(text)
             self.log(f"RESULT: {self.mode} {self.verdict}: {self.detail}")
         if self.verdict == "PASS":
             code = 0
@@ -1760,6 +2303,9 @@ def main():
     d4.add_argument("--no-drop", action="store_true",
                     help="--conf: skip the drop test and stay on the conference until it ends, "
                          f"Ctrl-C or {TALK_LIMIT} s")
+    d4.add_argument("--no-key-check", action="store_true",
+                    help="--conf: do not record the conference audio during the talk, so no "
+                         "search for key tones (keypad events on leg3 are still logged)")
     opt = ap.parse_args()
     d4_mode = opt.probe or opt.conf
     if opt.moh and opt.probe:
@@ -1773,7 +2319,8 @@ def main():
             ("--refer-in", opt.refer_in, opt.conf, "--conf"),
             ("--dial-out", opt.dial_out, opt.conf, "--conf"),
             ("--flash", opt.flash, opt.conf, "--conf"),
-            ("--no-drop", opt.no_drop, opt.conf, "--conf")):
+            ("--no-drop", opt.no_drop, opt.conf, "--conf"),
+            ("--no-key-check", opt.no_key_check, opt.conf, "--conf")):
         if given and not allowed:
             ap.error(f"{flag} works only with {where}")
     if opt.dial_out and opt.refer_in == "legs":

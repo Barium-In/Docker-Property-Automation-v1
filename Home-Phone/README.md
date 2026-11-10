@@ -115,7 +115,7 @@ While the script runs, `docker exec home-phone asterisk -rx "ari show apps"` lis
 - **D3, D3b, E2 and D4 join two phones.** Put the testers in separate rooms, or use wired earphones on both, or the phones will howl.
 - **D4 has its own briefing** for the forward-number owner: see [Before a D4 run](#before-a-d4-run).
 - Run each mode as its own call. The script handles one test and exits. Its last line is `TESTD RESULT: ...`.
-- `Ctrl-C` stops the script at any point. It then clears `TESTD_WAIT`, hangs up the calls it holds and closes its connection.
+- `Ctrl-C` stops the script at any point. It then clears `TESTD_WAIT`, deletes the D4 key-check recording if one exists, hangs up the calls it holds and closes its connection.
 
 ### Run
 
@@ -135,7 +135,7 @@ Then, for each mode: start the script, call the landline from a test number, and
 | D3b | `python3 tests/testd.py --mix-direct` | As D3 with a shorter order: you come off hold while the mobile stays active, then both are joined. Run it after D3. | As D3. |
 | E2 | `python3 tests/testd.py --wait-in` | You go on hold and the script waits 60 s. The forward-number owner rings the landline. The script answers, takes you off hold and joins both. | Did the second call ring through, or did the mobile hear busy or a message? |
 | D4a | `python3 tests/testd.py --probe` | No call in, and no phone rings. The script dials each likely conference factory address once and hangs up. See [Test D4](#test-d4-network-conference). | The `D4a N:` lines and the RESULT. Paste the output and the trace after each run (see [Run D4](#run-d4)). |
-| D4 | `python3 tests/testd.py --conf --conf-uri '<the URI D4a found>'` | As D1 until the mobile answers. Then the script asks Airtel for a conference and moves both calls into it, and asks you questions at the terminal. See [Test D4](#test-d4-network-conference). | Your answers to the questions; whether the mobile rang a second time (call waiting); what each phone heard after Airtel's hold message; whether `*` beeped; the drop answer. Paste the output and the trace after each run. |
+| D4 | `python3 tests/testd.py --conf --conf-uri '<the URI D4a found>'` | As D1 until the mobile answers. Then the script asks Airtel for a conference and moves both calls into it, runs the key check during the talk, and asks you questions at the terminal. See [Test D4](#test-d4-network-conference). | Your answers to the questions; whether the mobile rang a second time (call waiting); what each phone heard after Airtel's hold message; whether `*` beeped; the `D4 key check` lines; the drop answer. Paste the output and the trace after each run. |
 | D4 flash | `python3 tests/testd.py --conf --flash` | As D1 until the mobile answers. Then the script sends Airtel the 3-party request from the line's own spec (TS 183 043) and asks you the same questions. See [Test D4](#test-d4-network-conference). | As D4, except that the mobile hears no hold message. |
 
 `--moh` can be added to D3, D3b, E2 and D4 as well. `--pause S` changes the 1.5 s wait between re-INVITE steps.
@@ -211,6 +211,12 @@ Once the results are written down, remove the full numbers that the test left be
 docker exec home-phone truncate -s 0 /var/log/asterisk/messages.log
 rm -f tests/testd-*.log
 ```
+The D4 key check deletes its recording itself and logs `deleted the recording testd-keys-... in Asterisk`. If the script was killed hard (`kill -9`) during the talk, a recording may be left in the container's memory. List and remove it:
+```bash
+docker exec home-phone ls -l /var/spool/asterisk/recording
+docker exec home-phone sh -c 'rm -f /var/spool/asterisk/recording/testd-keys-*'
+```
+The `sh -c` lets the container's own shell expand the `*`. The folder is a tmpfs, so restarting the container also clears it.
 Docker's own copy rotates away after 30 MB. To drop it now, recreate the container: `docker compose --env-file ../.env up -d --force-recreate`.
 
 ### Switch it off (rollback)
@@ -240,9 +246,15 @@ No public source gives the factory address for Airtel's fixed-line core, so D4 c
 
 D4 adds a three-line dialplan context, `[testd-refer]`, at the end of `config/extensions.conf`. Only ARI can send a call there. It runs `Transfer()`, which sends a REFER inside that call's own SIP dialog, and hands the result (`TRANSFERSTATUS` and the SIP code) back to the script. No endpoint uses the context, so no call from outside reaches it. Nothing is installed in the container and nothing new registers. D1 to E2 run as before.
 
+D4 also runs a **key check** during the talk. In the Ganpath design a family member presses `*` to bring Ganpath back into a call. In a merged network conference Ganpath has only its own call to the conference (leg3), which carries the mixed audio. The key check shows whether key presses from either phone reach leg3 at all:
+- as keypad events (RFC 4733), which the script logs as `event ChannelDtmfReceived leg3`;
+- or as DTMF tones inside the mixed audio. Asterisk does not detect those, because `telephone-event` was negotiated on leg3, so they would pass as plain sound.
+
+For the second, the script puts an ARI snoop channel on leg3 that hears what the conference sends (`spy=in`) and records it as an 8 kHz WAV, `/var/spool/asterisk/recording/testd-keys-<random>.wav` in the container. `docker-compose.yml` mounts that folder as a 16 MB tmpfs, so the recording is held in memory and no file of it is written to den-ubuntu's disk. When the talk ends the script stops the recording, downloads the file into its own memory, deletes it in Asterisk and searches it for tones with a detector modelled on Asterisk's own (`main/dsp.c`). The two phones press different digits, so a tone shows whose key got through. `--no-key-check` skips the recording.
+
 ### Set up D4
 
-The `config/` files are copied into the image when it is built, so the first D4 run needs the new files on den-ubuntu and a rebuild. From this folder:
+The `config/` files are copied into the image when it is built, so the first D4 run needs the new files on den-ubuntu and a rebuild. The key check needs the container recreated from the current `docker-compose.yml`, which mounts `/var/spool/asterisk/recording` as a tmpfs. Ubuntu's Asterisk package ships no such folder, so without the mount ARI's record answers HTTP 500 and the key check does not run. The `up` below does both. From this folder:
 ```bash
 git pull
 docker compose --env-file ../.env up -d --build
@@ -250,6 +262,9 @@ docker exec home-phone asterisk -rx "dialplan show testd-refer"                 
 docker exec home-phone asterisk -rx "core show function PJSIP_RESPONSE_HEADER"    # present
 docker exec home-phone asterisk -rx "pjsip show registrations"                    # Registered
 docker logs home-phone 2>&1 | grep "Test D"                                       # Test D on
+docker exec home-phone df -h /var/spool/asterisk/recording                        # key check: tmpfs, 16M
+docker exec home-phone ls -ld /var/spool/asterisk/recording                       # key check: drwx------ asterisk asterisk
+docker exec home-phone asterisk -rx "module show like snoop"                      # key check: res_stasis_snoop.so Running
 ```
 
 ### Conference factory addresses
@@ -277,6 +292,8 @@ A URI with a space, quote, bracket, comma, brace or backslash stops the script b
 
 Tell the forward-number owner what to expect:
 - Answer the landline's call and you hear hello-world. Then you hear Airtel's hold message for a few seconds, then hello-world again and the caller's voice. Talk to each other.
+- The caller presses 1 three times and then says "now". Then press 2 three times, about a second apart, so the script can tell whose key presses got through. Stay quiet while either of you presses keys: speech over a tone can hide it.
+- The script records the conference audio during the talk, only to look for key tones. The recording stays in memory inside the container on den-ubuntu, and the script deletes it as soon as the talk ends.
 - If your phone shows a second call from the landline (call waiting), answer it, and tell the person at the terminal.
 - At the end the landline drops out. Say whether you can still hear the caller, then hang up.
 - With `--flash` your call is not put on hold, so there is no hold message: after the first hello-world, wait for the second one and the caller's voice.
@@ -305,7 +322,7 @@ Without it the script skips that address and says so.
    ```
    If nothing answers as a focus, D4 cannot run. The remaining sources are an exported config from a provisioned Airtel router (its `ConferenceCallDomainURI`, or `X_5067F0_ConferenceURI` and `MixerMode`) or Airtel itself, and stage 2 stays on consult and return.
 3. **If D4a is UNCLEAR** (a `200 OK` without `;isfocus`), read that `200 OK` in the trace: its Contact, Allow, Server and Record-Route. If it looks like a conference server (Allow lists REFER, the Contact is a conference-style URI), D4 can still try it.
-4. **D4.** Brief the forward-number owner first. Then run the command that D4a's RESULT line gives. It carries `--icsi` when D4a found the focus only with it:
+4. **D4.** Brief the forward-number owner first. Then run the command that D4a's RESULT line gives. When the probe ran with `--icsi`, the line says so: add `--icsi` to D4 only if no probe without it found the same focus.
    ```bash
    python3 tests/testd.py --conf --conf-uri '<the URI D4a found>'
    ```
@@ -327,13 +344,19 @@ What the script does in D4:
 3. It reads both calls' Call-ID, tags, remote URI and contact.
 4. It calls the conference factory (leg3) and reads the Contact of its `200 OK`.
 5. It sends a REFER inside leg3's dialog for the mobile's call, with `Refer-To <sip:+91XXXXXX1234@<domain>;method=INVITE?Replaces=...&Require=replaces>`, and waits for the result and for Airtel to end the old call. It waits 1.5 s, then does the same for your call.
-6. It plays hello-world into the conference and prints `D4: conference up`.
+6. It plays hello-world into the conference.
+7. It starts the key check: a snoop channel on leg3 (`D4 key check: snoop on leg3`) and its recording (`D4 key check: recording testd-keys-... in the container`). Then it prints `D4: conference up` (with `--flash`, `D4 flash: leg3 is up`).
 
 During the talk:
-- Talk on both phones. Press `*` and then `#` on your phone. A beep and the end of the talk show that keys pass through Airtel's conference; otherwise nothing happens.
+- Talk on both phones until you hear each other.
+- Then the key check, once the terminal shows `D4: conference up` (with `--flash`, `D4 flash: leg3 is up`). That line comes after the recording has started. Both of you stay quiet while keys are pressed. Press 1 three times on your phone, about a second apart, then say "now". The forward-number owner presses 2 three times the same way. Then press `*` and then `#` on your phone.
+- A beep after `*` and the end of the talk after `#` show that keys reach the script as keypad events. The recording shows whether they reach the conference audio as tones.
 - Press Enter at the terminal when you are done, or type `n` if either of you could not hear the other.
+- The script stops the recording, downloads it into memory, deletes it in Asterisk (`deleted the recording testd-keys-... in Asterisk`) and searches it for tones. This takes a few seconds, then the next question comes.
 - Answer `Did both phones hear each other and hello-world? y/n`.
 - The script then hangs up leg3 (with `--flash`, all three of its calls) and asks `Are the two phones still connected? y/n`. The testers answer, then hang up. With `--no-drop` the script skips this and stays on the conference (see the table below).
+
+The recording runs only during the talk. If leg3 ends during the talk, the snoop channel and its recording end with it, and the script still downloads, deletes and searches what was recorded. On `Ctrl-C`, or when Asterisk closes the event connection, the script deletes the recording without searching it.
 
 Each fallback run is its own call, chosen by the result before it:
 
@@ -344,7 +367,8 @@ Each fallback run is its own call, chosen by the result before it:
 | `--dial-out both` | Both `Refer-To` forms got `NOTIFY` with `481`. | The script hangs up both calls and the conference calls the caller and the mobile back. |
 | `--flash` | In every D4 session (step 5 above). | TS 183 043 C.14.3: no hold of the mobile and no REFER. With you held and the mobile active, the script INVITEs `sip:flash@{domain}` (or the first `--conf-uri`) as leg3 and waits 5 s for Airtel to join the calls. The script keeps your call and the mobile's until the drop test. |
 | `--icsi` | Repeat the best run with it. | Adds the MMTEL `Accept-Contact` and `P-Preferred-Service` headers to the factory or flash INVITE. |
-| `--no-drop` | You want the conference to stay up at the end. | No drop test. The script stays on the conference until it ends (for example when both testers hang up), Ctrl-C, or 300 s, then leaves. |
+| `--no-drop` | You want the conference to stay up at the end. | No drop test. The script stays on the conference until it ends (for example when both testers hang up), Ctrl-C, or 300 s, then leaves. The key check still ends with the talk. |
+| `--no-key-check` | Someone on the call does not want it recorded, or the key question is already answered. | No snoop channel and no recording. Keypad events on leg3 are still logged, and the RESULT says `Key check: off`. |
 | `--moh` | As in D2. | Our music plays to you until your call's REFER (with `--flash`, until the flash INVITE). |
 
 When the session is done, follow [Read and paste the trace](#read-and-paste-the-trace) for the last run, then [When the session is done](#run) and [Clear the logs](#clear-the-logs), in that order. The verbose `Executing [s@testd-refer:1] Transfer(...)` lines carry the full number, like other verbose lines.
@@ -390,7 +414,12 @@ Each script line starts with `HH:MM:SS TESTD`. ARI reports a Q.850 cause, which 
 | `leg3 has gone` | A received `BYE` on leg3: the conference dropped us. FAIL. |
 | `--refer-in legs`: `leg2 ended after its REFER` | The REFER on leg2's own Call-ID, with `Refer-To <conference URI?Replaces=...>`, got `202 Accepted`, no NOTIFY, then a `BYE` on leg2 within seconds. That is success for this method (RFC 4579 / TS 24.147). A `405` here, like the one on 9 Nov, means Airtel allows no REFER inside a party's call. |
 | `D4: conference up` | RTP only, no new SIP. A received re-INVITE on leg3 with `a=sendonly` or `a=inactive` (`the carrier now holds leg3`) means the conference holds us, and the result is FAIL. |
-| Keys | `event ChannelDtmfReceived leg3 digit=*` means Airtel's conference passes keypad events through. The script cannot tell who pressed. No key events means the keys stop at the conference server, which the standards allow. |
+| Keys | `event ChannelDtmfReceived leg3 digit=*` means Airtel's conference passes keypad events through. The digit shows who pressed: 1 is the test phone and 2 the forward number's phone. No key events means the keys stop at the conference server as events, which the standards allow; the key check then says whether they come through as tones. |
+| `D4 key check: tone 1 at 4.21 s, 96 ms, low tone -9 dBm0, high tone -7 dBm0`, one line per tone, then `7 key tone(s): 1 x3, 2 x3, * x1 in 34 s of conference audio` | The conference plays key presses into the mixed audio as DTMF tones. The digits show whose presses got through. Times count from the start of the recording. The levels show where a tone came from: one the network plays sits near -10 dBm0 per tone, a few dB lower after the mixer, and one far below that (under about -25 dBm0) is more likely a phone's own keypad sound picked up by its microphone. RESULT: `Key check: ...; in-band tones in the conference audio: 1 x3, 2 x3, * x1`. For Ganpath: it can listen for `*` in the mix it hears on its own call. |
+| RESULT `Key check: keypad events on leg3: 1 1 1 2 2 2 * #` | Key presses arrive as events, as on a normal call. For Ganpath: `*` works as a keypad event. |
+| RESULT `Key check: no keypad events and no key tones in 34 s of conference audio: key presses stop at Airtel's conference` | Neither form reached leg3 while the testers pressed keys. For Ganpath: a family member has to say "Ganpath" or use the app to call Ganpath in. Check the testers did press the keys during the talk, and stayed quiet while they pressed: speech over a tone can hide it. |
+| RESULT `Key check did not run: <reason>` | The snoop channel or the recording was refused, the download failed, or the file was not 8 kHz 16-bit mono WAV. The reason is the ARI answer. `Asterisk refused the recording (HTTP 500 ...)` usually means the container runs without the tmpfs for the recording folder: recreate it as under [Set up D4](#set-up-d4). The test's own result still stands. |
+| `could not delete the recording testd-keys-...` | ARI refused the delete. The file is still in the container: remove it with the command under [Clear the logs](#clear-the-logs). The RESULT line repeats this. |
 | Your answers | `y` to both-heard gives PASS. `n` gives FAIL (`signalling joined both calls, but the testers could not hear each other`). No answer gives UNCLEAR. |
 | `D4 drop: still connected: y` | Airtel keeps the conference after Ganpath's calls leave, so consult, conference, then leave works as a transfer. `n` means the conference ends with Ganpath's call. Either way the trace shows our `BYE` on leg3 (with `--flash`, on all three calls) and nothing more. |
 | `D4 --no-drop: left the conference after N s` | Why the script left: Airtel ended leg3 (a received `BYE` on leg3, for example once both testers hung up), Ctrl-C, or the 300 s limit. The RESULT line repeats it. |
@@ -410,9 +439,26 @@ Each script line starts with `HH:MM:SS TESTD`. ARI reports a Q.850 cause, which 
 
 Other D4 results:
 - `RESULT: D4 PASS` (without `--flash`) also needs `isfocus=yes`. With `isfocus=unreadable` it passes with a note to check the trace. With `isfocus=no` and every other step passing, the result is UNCLEAR: read the factory's `200 OK` before relying on it.
-- Each D4 RESULT line ends with what the script cannot know. It cannot hear the call, so the audio verdict is the testers'.
-- `Ctrl-C` at any point hangs up leg3 (even during a REFER), then the mobile's call and yours, and clears `TESTD_WAIT`.
+- Each D4 RESULT line says that the audio verdict is the testers': the script judges no voices. The key check's sentence comes last, and it never changes PASS, FAIL or UNCLEAR.
+- `Ctrl-C` at any point deletes the key-check recording, hangs up leg3 (even during a REFER), then the mobile's call and yours, and clears `TESTD_WAIT`.
 - If the conference survives the drop test, the two testers have to hang up themselves.
+
+### Line check during a merged call
+
+This answers one question for a later session, with no code change: while Airtel's conference holds the merged call, does the line take a new call? It needs a third phone that is not one of the two in the call, and not a SIP app such as Zoiper, which would take the line over.
+
+1. Run D4 as usual (`--conf --conf-uri '<the URI D4a found>'`).
+2. Answer the drop question. If the answer is `y`, keep both phones talking. If it is `n`, the merged call has ended and there is nothing to check: skip the steps below.
+3. Call the landline from the third phone.
+4. On den-ubuntu:
+   ```bash
+   docker logs --since 5m home-phone 2>&1 | grep -E "Incoming call|Not a test caller"
+   ```
+
+| What you see | Meaning |
+|---|---|
+| A new `Incoming call from a number ending in ...` line from the third phone | Airtel offered the new call to Asterisk while the merged call was still going. A caller who is not a test number hears ringing for 40 s; a test number hears hello-world. |
+| No new line, and the third phone hears busy or a message | The merged call still occupies the line. |
 
 ## Troubleshooting
 
@@ -428,5 +474,5 @@ docker exec home-phone asterisk -rx "pjsip set logger off"
 - **Outgoing call rejected with 404/484:** try the `0XXXXXXXXXX` number form.
 - **Option 4 gives an error beep at once:** the script isn't running, or Test D is off. `docker logs home-phone 2>&1 | grep -E "Test D|home-phone-testd"` shows which. `Stasis app 'home-phone-testd' not registered` (no run since Asterisk started) or `... not active` (an earlier run has ended) means the script isn't connected.
 - **The SSH session closed mid-test:** the script still clears up (hangs up both calls, resets `TESTD_WAIT`) and writes its `RESULT` line to `tests/testd-<date>-<time>.log`.
-- **The script was killed with `kill -9` mid-test:** the caller may sit in silence until they hang up, and the next call in goes through the stage-1 menu as usual. `docker exec home-phone asterisk -rx "channel request hangup all"` ends any call left over.
+- **The script was killed with `kill -9` mid-test:** the caller may sit in silence until they hang up, and the next call in goes through the stage-1 menu as usual. `docker exec home-phone asterisk -rx "channel request hangup all"` ends any call left over. During a D4 talk it may also leave a key-check recording: remove it as under [Clear the logs](#clear-the-logs).
 - **The script stops with `401`:** the exported `HOME_PHONE_ARI_PASSWORD` differs from the one the container started with. Export it again, or recreate the container after changing `.env`.
