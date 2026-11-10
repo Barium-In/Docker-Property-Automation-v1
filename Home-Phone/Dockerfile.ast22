@@ -1,0 +1,152 @@
+# Asterisk 22.12.0 LTS from the upstream release (stage 2, phase 7). Opt-in:
+# docker-compose.ast22.yml selects this file and tags the image home-phone-asterisk:22.12.0.
+# Dockerfile (Ubuntu's 20.6 package, image home-phone-asterisk:local) stays the default and
+# the rollback. See README, "Asterisk 22.12 (stage 2, phase 7)".
+#
+# The build stage compiles only the modules in ast22/modules.txt. The runtime stage gets the
+# installed files, the libraries they link, Ubuntu's sound packages, and the same config/ and
+# entrypoint.sh as the 20.6 image.
+
+FROM ubuntu:24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# The compiler; the libraries configure requires (libedit, jansson, sqlite3, uuid, libxml2);
+# OpenSSL for TLS and DTLS; libcurl for CURL(); uriparser and libxslt as 20.6 links them; and
+# what the bundled pjproject needs at configure time (curl, bzip2, patch).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential pkg-config ca-certificates curl bzip2 patch \
+        libedit-dev libjansson-dev libsqlite3-dev uuid-dev libxml2-dev libxslt1-dev \
+        libssl-dev libcurl4-openssl-dev liburiparser-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# The release tarball and the pjproject tarball its configure would otherwise download
+# itself, each checked against a pinned SHA-256. The Asterisk sum matches the release's
+# .sha256 file and its signed tarball. The pjproject URL names a commit of
+# asterisk/third-party, and the file matches the .md5 inside the release.
+ARG ASTERISK_VERSION=22.12.0
+ARG ASTERISK_SHA256=f8b2ba98aac6c4ff3376bc0a2868bea6ed577ca684efb7ec739ae6e8ce6e35e2
+ARG PJPROJECT_VERSION=2.17
+ARG PJPROJECT_SHA256=04b2eb1f0f01aa0ad1945b167171843448a51aa6b7c3e806496d434f13a112b7
+ARG PJPROJECT_URL=https://raw.githubusercontent.com/asterisk/third-party/4d3b9cfdf9fe4f68d3674191707415faceec0ec6/pjproject/2.17/pjproject-2.17.tar.bz2
+
+WORKDIR /usr/src
+RUN set -eu; \
+    curl -fsSL --retry 3 -o asterisk.tar.gz \
+        "https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-${ASTERISK_VERSION}.tar.gz" \
+    || curl -fsSL --retry 3 -o asterisk.tar.gz \
+        "https://github.com/asterisk/asterisk/releases/download/${ASTERISK_VERSION}/asterisk-${ASTERISK_VERSION}.tar.gz"; \
+    echo "${ASTERISK_SHA256}  asterisk.tar.gz" | sha256sum -c -; \
+    mkdir externals; \
+    curl -fsSL --retry 3 -o "externals/pjproject-${PJPROJECT_VERSION}.tar.bz2" "${PJPROJECT_URL}"; \
+    echo "${PJPROJECT_SHA256}  externals/pjproject-${PJPROJECT_VERSION}.tar.bz2" | sha256sum -c -; \
+    tar -xzf asterisk.tar.gz; \
+    mv "asterisk-${ASTERISK_VERSION}" asterisk; \
+    rm asterisk.tar.gz
+
+# The same directories as Ubuntu's package: /usr/sbin, /etc/asterisk, /var/lib/asterisk,
+# /var/spool/asterisk, /var/log/asterisk. Modules go to /usr/lib/asterisk/modules.
+# --with-externals-cache points the pjproject step at the checked tarball, so nothing is
+# downloaded here. --with-gsm=internal uses the GSM codec in the tree (gsm prompts and music
+# on hold). The --with-* lines make configure stop if a library is missing, so nothing is
+# dropped without a message. --disable-binary-modules blocks the closed-source downloads.
+WORKDIR /usr/src/asterisk
+RUN ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libdir=/usr/lib \
+        --with-pjproject-bundled --with-externals-cache=/usr/src/externals \
+        --with-gsm=internal --with-ssl --with-crypto --with-uriparser --with-libxslt \
+        --disable-binary-modules
+
+# menuselect: switch off every module category, the utilities and the sound downloads, then
+# switch on the modules in ast22/modules.txt. BUILD_NATIVE goes off so the binary does not
+# depend on this CPU (no -march=native). --disable-all is not used, because it would also
+# clear OPTIONAL_API from the compiler flags. --enable gives no message when a module cannot
+# be built, so the install step below checks the result.
+COPY ast22/modules.txt /usr/src/modules.txt
+RUN set -eu; \
+    make menuselect.makeopts; \
+    set --; \
+    for m in $(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' /usr/src/modules.txt); do \
+        set -- "$@" --enable "$m"; \
+    done; \
+    menuselect/menuselect \
+        --disable-category MENUSELECT_ADDONS --disable-category MENUSELECT_APPS \
+        --disable-category MENUSELECT_BRIDGES --disable-category MENUSELECT_CDR \
+        --disable-category MENUSELECT_CEL --disable-category MENUSELECT_CHANNELS \
+        --disable-category MENUSELECT_CODECS --disable-category MENUSELECT_FORMATS \
+        --disable-category MENUSELECT_FUNCS --disable-category MENUSELECT_PBX \
+        --disable-category MENUSELECT_RES --disable-category MENUSELECT_TESTS \
+        --disable-category MENUSELECT_UTILS --disable-category MENUSELECT_AGIS \
+        --disable-category MENUSELECT_CORE_SOUNDS --disable-category MENUSELECT_MOH \
+        --disable-category MENUSELECT_EXTRA_SOUNDS \
+        --disable BUILD_NATIVE \
+        "$@" menuselect.makeopts
+
+# ASTDATADIR=/usr/share/asterisk is where Ubuntu's sound packages put the prompts and music
+# on hold; Debian builds 20.6 with the same value. DEBUG= drops the -g3 debug info that the
+# Makefile adds by default, which cuts the compiler's memory on a small host. MAKE_JOBS comes
+# from docker-compose.ast22.yml (default 2).
+ARG MAKE_JOBS=2
+RUN make -j"${MAKE_JOBS:-2}" ASTDATADIR=/usr/share/asterisk DEBUG=
+
+# Install into /out, then check the module set: the build stops if a listed module is
+# missing or an unlisted one was built. /var/run is a link to /run in the runtime image and
+# the entrypoint creates /var/run/asterisk, so it is left out. The empty sounds and moh
+# directories are removed so the copy below leaves the sound packages' files and links
+# alone; rmdir fails the build if anything was installed in them. The bundled pjproject
+# always compiles with -g3, so debug sections are stripped from every binary; symbol names
+# stay for backtraces.
+RUN set -eu; \
+    make install DESTDIR=/out ASTDATADIR=/usr/share/asterisk DEBUG=; \
+    rm -rf /out/var/run /out/usr/share/man /out/usr/lib/pkgconfig; \
+    rmdir /out/usr/share/asterisk/sounds /out/usr/share/asterisk/moh; \
+    find /out/usr/sbin /out/usr/lib -type f \
+        \( -name asterisk -o -name '*.so' -o -name '*.so.*' \) -exec strip --strip-debug {} +; \
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' /usr/src/modules.txt | sort -u > /tmp/want; \
+    ls /out/usr/lib/asterisk/modules | sed -n 's/\.so$//p' | sort -u > /tmp/have; \
+    missing=$(comm -23 /tmp/want /tmp/have); \
+    extra=$(comm -13 /tmp/want /tmp/have); \
+    if [ -n "$missing" ] || [ -n "$extra" ]; then \
+        echo "Module set differs from ast22/modules.txt."; \
+        echo "Missing (not built):" $missing; \
+        echo "Built but not listed:" $extra; \
+        exit 1; \
+    fi; \
+    echo "All $(wc -l < /tmp/want) modules in ast22/modules.txt were built."
+
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# The libraries the build links (ldd checks them below), envsubst for the config templates,
+# time zones, and Ubuntu's prompts and music on hold. The sound packages depend on nothing
+# from Ubuntu's Asterisk. asterisk-core-sounds-en is named on its own: it creates the
+# sounds/en link, and --no-install-recommends would skip it. The asterisk user and group
+# replace the ones the 20.6 package creates; the entrypoint chowns its directories on
+# every start, so the UID need not match the 20.6 image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libedit2 libjansson4 libsqlite3-0 libuuid1 libxml2 libxslt1.1 libssl3t64 \
+        libcurl4t64 liburiparser1 ca-certificates gettext-base tzdata \
+        asterisk-core-sounds-en asterisk-core-sounds-en-gsm asterisk-moh-opsound-gsm \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system asterisk \
+    && useradd --system --gid asterisk --home-dir /var/lib/asterisk --no-create-home \
+        --shell /usr/sbin/nologin asterisk
+
+COPY --from=build /out/ /
+
+# Stop here if a library is missing or the binary does not run.
+RUN ldconfig \
+    && ! ldd /usr/sbin/asterisk /usr/lib/libasterisk*.so.* /usr/lib/asterisk/modules/*.so \
+        | grep 'not found' \
+    && asterisk -V \
+    && chown -R asterisk:asterisk /var/cache/asterisk
+
+COPY ast22/asterisk.conf /etc/asterisk/asterisk.conf
+COPY config/ /opt/home-phone/config/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

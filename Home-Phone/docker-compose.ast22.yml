@@ -1,0 +1,19 @@
+# Opt-in Asterisk 22.12.0 LTS image (stage 2, phase 7). See README.
+# This file only changes how the image is built and what it is called. Everything else
+# (host networking, the root .env, logs, restart policy) comes from docker-compose.yml.
+#
+# Switch to 22.12, from this folder:
+#   docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d --build
+# Back to 20.6 (image home-phone-asterisk:local). --build puts the checkout's config/ and
+# entrypoint.sh into that image; with Ubuntu's package in the build cache it takes seconds:
+#   docker compose --env-file ../.env up -d --build
+services:
+  asterisk:
+    build:
+      context: .
+      dockerfile: Dockerfile.ast22
+      args:
+        # Parallel compile jobs. Run with MAKE_JOBS=1 in the shell if the build runs short
+        # of memory.
+        MAKE_JOBS: "${MAKE_JOBS:-2}"
+    image: home-phone-asterisk:22.12.0

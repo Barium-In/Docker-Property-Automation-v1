@@ -9,6 +9,8 @@ The fibre landline that comes with the broadband connection, run from this host 
 
 [Test D](#test-d-hold-then-dial) is the first step of stage 2. It checks whether the line can hold one call and place or take a second one, and stays off unless you switch it on. Its last part, [Test D4](#test-d4-network-conference), checks whether Airtel's network will run a 3-way call itself.
 
+[Asterisk 22.12](#asterisk-2212-stage-2-phase-7) is an opt-in image for the rest of stage 2; the default build stays on Ubuntu's Asterisk 20.6.
+
 ## Why it is built this way
 
 - **Host networking.** Call audio (RTP, UDP 10000–10100) has to reach the VM's LAN IP directly. Docker's bridge NAT breaks it.
@@ -459,6 +461,132 @@ This answers one question for a later session, with no code change: while Airtel
 |---|---|
 | A new `Incoming call from a number ending in ...` line from the third phone | Airtel offered the new call to Asterisk while the merged call was still going. A caller who is not a test number hears ringing for 40 s; a test number hears hello-world. |
 | No new line, and the third phone hears busy or a message | The merged call still occupies the line. |
+
+## Asterisk 22.12 (stage 2, phase 7)
+
+Stage 2 moves to Asterisk 22.12.0 LTS, built from the upstream release. Ubuntu's 20.6 can hang up an AudioSocket call when a frame arrives in pieces, and Ganpath's audio goes over AudioSocket. It has also had no security update since April 2024, so it lacks the June 2026 ARI and PJSIP fixes. The private stage-2 plan (section 4.6) has the sources.
+
+The 22.12 image is opt-in. `Dockerfile` (Ubuntu's 20.6 package, image `home-phone-asterisk:local`) stays the default and is the rollback. Both images are built from the same `config/` and `entrypoint.sh` and read the same root `.env`. Each image holds the copies from its own last build, so a change to either file reaches an image only when that image is rebuilt.
+
+| File | What it does |
+|---|---|
+| `Dockerfile.ast22` | Two stages. The build stage downloads the 22.12.0 release and the pjproject 2.17 tarball it bundles, checks both against pinned SHA-256 sums, and compiles. The runtime stage holds the installed files, the libraries they link, Ubuntu's prompts and music on hold, and the same config and entrypoint. |
+| `ast22/modules.txt` | The 94 modules built, with the reason for each group. The build stops if one is missing or an unlisted one appears. |
+| `ast22/asterisk.conf` | The directories, with the paths the 20.6 image uses. It sits outside `config/`, so the 20.6 image never gets it. |
+| `docker-compose.ast22.yml` | Compose override: builds from `Dockerfile.ast22` and tags the image `home-phone-asterisk:22.12.0`. |
+| `tests/check-ast22.sh` | Checks the running container and prints PASS, FAIL or SKIP per line. It prints no command output, so no number or address. |
+
+What differs on 22.12:
+
+| Item | 20.6 image | 22.12 image |
+|---|---|---|
+| Modules | all of Ubuntu's (346) | the 94 in `ast22/modules.txt`. Left out on purpose: `func_env`, `func_shell` and `app_system` (file and shell access), CDR and CEL, other channel drivers, SIP MESSAGE, MWI, presence, T.38. |
+| pjproject | 2.13.1 | 2.17 |
+| Our SIP headers | `Allow` lists MESSAGE; `Allow-Events` lists presence, dialog and message-summary | no MESSAGE, and `Allow-Events` without those three |
+| `ari show users` | `No    homephone` | `No    No    homephone` (a new ACL column) |
+| Option 4 with no script run since Asterisk started | ERROR `Stasis app 'home-phone-testd' not registered` | WARNING `Stasis app 'home-phone-testd' doesn't exist`, then the same error beep. The grep under [Troubleshooting](#troubleshooting) still finds it. |
+| A ring that times out (D1b, the D4 factory call) | no cause set | cause 19, which the script labels `SIP 480/483`. The trace shows whether a 480 came back. |
+| Opus | Debian's `codec_opus_open_source` | none: `core show translation paths opus` is empty. The line uses G.711 only. |
+| RTP SSRC | kept when a call joins or leaves a bridge | a new SSRC each time a call joins or leaves a bridge: option 3, D3, D3b, E2 and every later Ganpath bridge. Upstream added it in 22.6.0. |
+| `dtmf_mode=auto` | after one SDP without `telephone-event`, the call stays on in-band keys | each SDP decides again: with `telephone-event`, RFC 4733 events; without it, in-band tones |
+
+The last two rows change only the media, so the SIP traces look the same. A difference in audio around a bridge, or in keys after a hold, points at them first.
+
+The rest of this README applies to both images. While 22.12 runs, every `docker compose` command in it needs `-f docker-compose.yml -f docker-compose.ast22.yml` before its other options. Without them, `up -d` (Test D on or off, [Clear the logs](#clear-the-logs)) switches back to 20.6. `export COMPOSE_FILE=docker-compose.yml:docker-compose.ast22.yml` in the shell adds them to every command until `unset COMPOSE_FILE`. A change in `config/` or `entrypoint.sh` needs the override's `up -d --build`. While the build cache is there, only the last steps run.
+
+### Build on den-ubuntu
+
+Pick a quiet time: no call and no Test D session. The 20.6 container keeps the line up until step 4, so steps 1 to 3 can run before the D4 key check. Do step 4 after the key check has run on 20.6, so the 22.12 run has a result to compare with.
+
+1. Get the files, from this folder: `git pull`.
+2. Check memory, disk and the rollback image:
+   ```bash
+   free -m                                # "available" about 1700 MB
+   df -h /var/lib/docker                  # a few GB free for the build
+   docker image ls home-phone-asterisk    # the "local" tag is listed: it is the rollback
+   ```
+   Note the 20.6 figures under [Memory](#memory) now, while 20.6 still runs.
+3. Build, with a log in your home folder:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env build 2>&1 | tee ~/ast22-build.log
+   ```
+   Watch memory from a second SSH session with `free -m -s 10` (`Ctrl-C` ends it); `docker stats` does not show build containers. Nothing has been measured. A guess: 15 to 40 minutes with two jobs, most of it in `main/` and pjproject, and a few hundred MB for each compiler process. The log ends the build stage with `All 94 modules in ast22/modules.txt were built.`
+   - If "available" drops below about 200 MB, press `Ctrl-C` in the build session. If the log shows `Killed` or `signal 9`, the build has already stopped. Either way, build again with one job. The download and configure steps are cached, so it starts again at the compile:
+     ```bash
+     MAKE_JOBS=1 docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env build 2>&1 | tee ~/ast22-build.log
+     ```
+   - If the one-job build also runs short of memory, stop there and send the end of `~/ast22-build.log`. 20.6 is still running, so nothing needs rolling back.
+   - `Module set differs from ast22/modules.txt` names the modules that did not build. Their errors are earlier in the log.
+   - The build cache takes a few GB. `docker builder prune` frees it once 22.12 is accepted; the next 22.12 build then compiles from the start.
+4. Switch, wait about 10 seconds for Asterisk to start and register, then read its first lines:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d
+   docker logs home-phone 2>&1 | grep -E 'Asterisk Ready|Test D (on|off)'   # the Test D line, then Asterisk Ready.
+   ```
+   From here calls go through 22.12. `docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d --build` does steps 3 and 4 in one command.
+
+### Checks after the switch
+
+```bash
+docker exec home-phone asterisk -rx "core show version"   # Asterisk 22.12.0 built by ...
+sh tests/check-ast22.sh                                    # PASS on every line; SKIP on the four Test D lines while Test D is off
+```
+The script waits up to 30 s for the registration. If the container is not running or the registration FAILs, the line is down. For that or any other FAIL, save the log and roll back at once, then send the FAIL lines:
+```bash
+docker logs home-phone > ~/ast22-start.log 2>&1      # holds numbers and the carrier's addresses: delete it once read
+docker compose --env-file ../.env up -d --build      # back to 20.6, as under Roll back to 20.6
+```
+
+The script's main checks, by hand:
+```bash
+for m in $(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' ast22/modules.txt); do
+  docker exec home-phone asterisk -rx "module show like $m.so" | grep "^$m\.so " | grep -qv "Not Running" || echo "MISSING $m"
+done                                                                              # prints nothing
+docker exec home-phone asterisk -rx "pjsip show registrations"                    # Registered
+docker exec home-phone asterisk -rx "dialplan show testd-refer"                   # -= 1 extension (3 priorities) in 1 context. =-
+docker exec home-phone asterisk -rx "core show function PJSIP_RESPONSE_HEADER"    # -= Info about Function 'PJSIP_RESPONSE_HEADER' =-
+docker exec home-phone asterisk -rx "http show status"    # Test D on: Server Enabled and Bound to 127.0.0.1:8088. Off: Server Disabled
+docker exec home-phone asterisk -rx "ari show users"      # Test D on: No    No    homephone
+docker exec home-phone asterisk -rx "timing test"         # Using the 'timerfd' timing module for this test.
+docker exec home-phone asterisk -rx "moh show files"      # Class: default, then File: /usr/share/asterisk/moh/...
+docker exec home-phone ls -ld /var/spool/asterisk/recording   # a folder owned by asterisk (D4 key check)
+```
+
+### Calls to repeat on 22.12
+
+Run each with `pjsip set logger on` and keep its redacted trace ([Read and paste the trace](#read-and-paste-the-trace)) to compare with the 20.6 runs.
+
+| Call | Steps | Same as 20.6 when |
+|---|---|---|
+| Option 1, echo | [Tests](#tests) | you hear yourself back |
+| Option 2, transfer | [Tests](#tests) | `TRANSFER RESULT` shows SIP 405 |
+| Option 3, bridge | [Tests](#tests) | `BRIDGE RESULT` shows cause 58 (Airtel's 488) |
+| Deflect (302) | [Tests](#tests), with the override in the `up -d` command | `TRANSFER RESULT` shows the status and SIP code of the 20.6 run |
+| Outgoing call | [Tests](#tests) | hello world, then the echo test |
+| D1 | [Run](#run): `python3 tests/testd.py` | `RESULT: D1 PASS` |
+| E | [Run](#run), the E check under the table | a second INVITE arrives during the echo test |
+| D4a | [Run D4](#run-d4), step 1: `python3 tests/testd.py --probe` | `RESULT: D4a PASS` with the same focus address |
+| D4 | [Run D4](#run-d4), with the URI D4a found (private notes) | `RESULT: D4 PASS`, the same drop-test answer, and the same `Key check:` result as the 20.6 run. If the keys differ, see the `dtmf_mode=auto` row above. |
+
+Then turn the logger off and [clear the logs](#clear-the-logs), with the override in the `--force-recreate` command.
+
+D4 covers part of two other migration checks in the plan. It sets a channel variable over ARI (`D4_REFER_TO`), and its key check records through a snoop on leg3, which is in no bridge. In the 22.12 source, a variable set over ARI may still write `TIMEOUT()` and `PJSIP_MOH_PASSTHROUGH()`; only functions marked dangerous are refused, such as `FILE()`, `DB()` and a `CURL()` write. A snoop on a bridged call and `tech_cause` need the phase-1 tools and run with them.
+
+### Memory
+
+Run both on 20.6 before the switch and on 22.12 after it, registered and idle, and note the figures:
+```bash
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' home-phone
+ps -C asterisk -o rss=,args=      # resident memory of the Asterisk process, in KB
+```
+
+### Roll back to 20.6
+
+```bash
+docker compose --env-file ../.env up -d --build
+docker exec home-phone asterisk -rx "core show version"   # Asterisk 20.6.0~dfsg...
+```
+If `COMPOSE_FILE` is exported, `unset COMPOSE_FILE` first. `--build` copies the checkout's `config/` and `entrypoint.sh` into the 20.6 image. Without it, `up -d` starts the 20.6 image with the files of its last build, which can be older. With Ubuntu's package in the build cache, the rebuild takes seconds. After `docker builder prune` it installs the package again, which takes longer and needs the internet. Going back to 22.12 is the override's `up -d --build`, which after a prune compiles everything again, as in step 3.
 
 ## Troubleshooting
 

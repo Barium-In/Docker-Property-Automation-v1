@@ -1,0 +1,138 @@
+# The modules the Asterisk 22.12 image builds (Dockerfile.ast22), one per line.
+# This list is the only place they are named:
+# - the build enables exactly these in menuselect, and fails if a .so is missing
+#   or one not listed here appears;
+# - tests/check-ast22.sh checks that each one is loaded and running.
+# Every module a listed one depends on is listed too.
+# Core features need no entry: Answer, Wait, Ringing, Hangup, Goto, GotoIf, Set,
+# local channels, the web server and the DNS manager are built into the binary.
+# Left out on purpose: func_env, func_shell and app_system (file and shell access
+# from the dialplan or ARI), CDR and CEL backends, other channel drivers, SIP
+# MESSAGE, MWI, presence, T.38 and the anonymous endpoint.
+
+# The line (config/pjsip.conf): registration with line=yes, calls matched to the
+# carrier's proxy address and then by user name, NAT handling, the caller ID the
+# carrier asserts (trust_id_inbound), keypad presses (dtmf_mode=auto), and
+# `pjsip set logger on` for traces.
+chan_pjsip
+res_pjsip
+res_pjproject
+res_sorcery_config
+res_sorcery_memory
+res_sorcery_astdb
+res_pjsip_session
+res_pjsip_pubsub
+res_pjsip_outbound_registration
+res_pjsip_outbound_authenticator_digest
+res_pjsip_endpoint_identifier_ip
+res_pjsip_endpoint_identifier_user
+res_pjsip_sdp_rtp
+res_pjsip_nat
+res_pjsip_caller_id
+res_pjsip_dtmf_info
+res_pjsip_logger
+
+# Transfers and headers: Transfer() sends REFER (menu option 2, [testd-refer]) or 302
+# (deflect mode); PJSIP_HEADER and PJSIP_RESPONSE_HEADER (Test D4); the Diversion and
+# Reason headers that 20.6 sends.
+res_pjsip_refer
+res_pjsip_header_funcs
+res_pjsip_diversion
+res_pjsip_rfc3326
+
+# Loaded by the 20.6 image too, kept so the SIP traces on 22 compare line for line.
+res_pjsip_rfc3329
+res_pjsip_path
+res_pjsip_dlg_options
+res_pjsip_empty_info
+res_pjsip_acl
+res_pjsip_sips_contact
+
+# Media: RTP, G.711 to the carrier, the gsm prompts and music on hold (Test D2).
+# res_timing_timerfd is the timer that snoops, softmix bridges and music on hold need.
+res_rtp_asterisk
+res_timing_timerfd
+codec_alaw
+codec_ulaw
+codec_a_mu
+codec_gsm
+format_gsm
+res_musiconhold
+
+# Bridges: ARI bridges (Test D3, E2, D4), Dial() (menu option 3), and the Announcer
+# channel that plays sounds and music into an ARI bridge.
+bridge_simple
+bridge_softmix
+bridge_native_rtp
+bridge_holding
+bridge_builtin_features
+bridge_builtin_interval_features
+chan_bridge_media
+
+# ARI and Stasis: tests/testd.py now, Ganpath from phase 1 (hold, originate, continue,
+# play, record, snoop, channel variables, the events websocket). res_ari_endpoints and
+# res_ari_sounds are loaded by 20.6 too.
+res_http_websocket
+res_websocket_client
+res_ari
+res_ari_model
+res_ari_channels
+res_ari_bridges
+res_ari_playbacks
+res_ari_recordings
+res_ari_asterisk
+res_ari_events
+res_ari_applications
+res_ari_endpoints
+res_ari_sounds
+res_stasis
+res_stasis_answer
+res_stasis_playback
+res_stasis_recording
+res_stasis_snoop
+app_stasis
+
+# Dialplan (config/extensions.conf) and the README's CLI commands: Dial, Playback,
+# Read, Echo, Transfer, ExecIf, Log, CALLERID(), LEN(), CHANNEL(), and
+# `channel originate` for the outgoing test.
+pbx_config
+app_dial
+app_playback
+app_read
+app_echo
+app_transfer
+app_exec
+app_verbose
+func_callerid
+func_strings
+func_channel
+res_clioriginate
+
+# Dialplan functions that 20.6 also loads: IF(), GLOBAL(), CUT().
+func_logic
+func_global
+func_cut
+
+# Stage 2, phases 1 to 6: AudioSocket and WebSocket media for externalMedia, the RTP
+# channel and its multicast helper, TIMEOUT(), URIENCODE(), CURL() for the HA
+# webhooks, Gosub and hangup handlers, HANGUPCAUSE(), resampling for 16 kHz streams,
+# the formats of recorded prompts and debug recordings, and the registrar and
+# inbound digest auth for the softphone in phase 4 (both loaded by 20.6 too).
+res_audiosocket
+chan_audiosocket
+app_audiosocket
+chan_websocket
+chan_rtp
+res_rtp_multicast
+func_timeout
+func_uri
+func_curl
+res_curl
+app_stack
+func_hangupcause
+codec_resample
+format_wav
+format_pcm
+format_sln
+res_pjsip_registrar
+res_pjsip_authenticator_digest
