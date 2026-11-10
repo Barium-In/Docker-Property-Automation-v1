@@ -17,6 +17,9 @@ Modes, one per run (--moh can be added to any of them):
   --wait-in     E2: hold leg1 and wait 60 s for a call in to the landline from the forward
                 number or a test number (leg2); answer it, unhold leg1, join both.
 In a 3-way, * on either phone plays a beep and # ends the test.
+If the carrier holds a leg from its side (a ChannelHold event: its answer to an unhold, or its
+own re-INVITE, carried a=sendonly or a=inactive) and the leg is still held when the test
+checks, the result is FAIL: that leg never had two-way audio.
 
   export HOME_PHONE_ARI_PASSWORD="$(grep '^HOME_PHONE_ARI_PASSWORD=' ../.env | cut -d= -f2-)"
   python3 tests/testd.py [--moh] [--mix | --mix-direct | --wait-in]
@@ -349,6 +352,7 @@ class TestD:
         self.flag_set = False  # TESTD_WAIT may be 1
         self.moh_on = False
         self.dtmf_from = set()
+        self.net_held = set()  # legs the carrier holds from its side (ChannelHold, no Unhold yet)
         self.step = "waiting for a test call"
         self.verdict = None
         self.detail = ""
@@ -439,6 +443,15 @@ class TestD:
         if "cause" in ev:
             bits.append(cause_str(ev.get("cause"), ev.get("cause_txt")))
         self.log(" ".join(str(b) for b in bits))
+        # Asterisk raises ChannelHold only for a hold from the far end (ast_queue_hold); the
+        # script's own holds raise none. So this is the carrier holding the leg.
+        if kind == "ChannelHold" and label in self.legs:
+            self.net_held.add(label)
+            self.log(f"note: the carrier now holds {label} from its side (its SDP carried "
+                     "a=sendonly or a=inactive)")
+        elif kind == "ChannelUnhold" and label in self.legs and label in self.net_held:
+            self.net_held.discard(label)
+            self.log(f"note: the carrier took {label} off hold from its side")
         if kind == "ChannelDestroyed" and label in self.legs:
             self.ended[label] = (ev.get("cause"), ev.get("cause_txt"))
             self.ended_at[label] = time.monotonic()
@@ -542,6 +555,11 @@ class TestD:
         self.play("D1c play " + ("beeperr" if failed else "hello-world") + " to leg1", "leg1",
                   "beeperr" if failed else "hello-world")
         if failed:
+            return
+        if "leg1" in self.net_held:
+            self.fail("the carrier kept leg1 on hold from its side after the unhold, so the "
+                      "caller could not hear anything. Check the trace: the 200 OK to the "
+                      "a=sendrecv re-INVITE carries a=sendonly or a=inactive.")
             return
         detail = ("hold sent, second call answered, leg1 still up after the unhold. "
                   "Confirm both phones heard hello-world"
@@ -749,6 +767,13 @@ class TestD:
             ended_by, clean = "Ctrl-C", True
         talk = int(time.monotonic() - start)
         keys = ", ".join(sorted(self.dtmf_from)) or "neither leg"
+        held = [label for label in ("leg1", "leg2") if label in self.net_held]
+        if held:
+            self.fail(f"the carrier kept {' and '.join(held)} on hold from its side, so only one "
+                      f"call had two-way audio. The 3-way ran {talk} s, ended by {ended_by}. "
+                      f"Keys arrived from {keys}. Check the trace: the carrier's SDP for that "
+                      "leg carries a=sendonly or a=inactive.")
+            return
         detail = (f"both legs stayed up through the re-INVITEs and the 3-way ran {talk} s, "
                   f"ended by {ended_by}. Keys arrived from {keys}. "
                   "Note whether each phone heard the other and hello-world.")
