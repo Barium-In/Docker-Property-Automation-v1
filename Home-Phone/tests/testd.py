@@ -35,10 +35,18 @@ Modes, one per run (--moh can be added to any of them):
                 question both testers hang up and press Enter, and the script keeps leg3 up
                 for S s (default 180) and logs whether and when Airtel ends it. The key
                 check's recording of leg3 runs from just after the merge to the end of the
-                watch; it is summarised as per-second levels (RMS dBFS) and deleted.
-  --conf --in2  D4-in2: as D4, but leg2 is a call IN. Hold leg1, wait 60 s for a call in from
-                the forward number (as E2), answer it as leg2, then as D4 from the hello-world
-                to leg2: hold it, the factory INVITE and the REFERs for leg2, then leg1.
+                watch; it is summarised as per-second levels (RMS dBFS), with a count of the
+                seconds of digital silence and the time of the last switch to all-zero audio,
+                and deleted.
+  --conf --in2 [--in2-wait S]  D4-in2: as D4, but leg2 is a call IN, in call-waiting order.
+                leg1 stays on an active call (no hold) while the script waits 60 s for a call
+                in from the forward number. That call is not answered: the script sends it
+                ringing, plays leg1 three beeps and waits S s (default 20) for a key from leg1.
+                1 adds the caller: hold leg1, answer leg2, then as D4 from the hello-world to
+                leg2 (hold it, the factory INVITE and the REFERs for leg2, then leg1). 2, or no
+                key in time, refuses it with busy (cause 17, which chan_pjsip should send as
+                486) and leg1 hears two beeps. Keys from leg2 are ignored. If leg2 stops
+                ringing first, the script says when.
 In a 3-way, * on either phone plays a beep and # ends the test.
 If the carrier holds a leg from its side (a ChannelHold event: its answer to an unhold, or its
 own re-INVITE, carried a=sendonly or a=inactive) and the leg is still held when the test
@@ -54,7 +62,7 @@ recording runs on until the watch ends (with --no-key-check too, then only for t
 
   export HOME_PHONE_ARI_PASSWORD="$(grep '^HOME_PHONE_ARI_PASSWORD=' ../.env | cut -d= -f2-)"
   python3 tests/testd.py [--moh] [--mix | --mix-direct | --wait-in | --conf [--flash]]
-  python3 tests/testd.py --conf [--in2] [--watch-end [S]] [--conf-uri URI]
+  python3 tests/testd.py --conf [--in2 [--in2-wait S]] [--watch-end [S]] [--conf-uri URI]
   python3 tests/testd.py --probe [--wide] [--all] [--icsi] [--conf-uri URI ...]
   (HOME_PHONE_TEST_PLMN=MCC-MNC in the shell, or --plmn, fills the mobile-form address)
 
@@ -91,6 +99,12 @@ APP, USER = "home-phone-testd", "homephone"
 RING_TIMEOUT = 30   # s the forward number rings before Asterisk gives up
 WAIT_IN = 60        # s E2 waits for a call in
 TALK_LIMIT = 300    # s a 3-way may run before the script ends it
+# D4 --in2, call waiting: how long leg2 rings while the script waits for 1 (add) or 2 (refuse)
+# from leg1. The default is the plan's second_call.decide_s.
+IN2_WAIT = 20
+IN2_WAIT_RANGE = (5, 120)
+IN2_CUE = "beep,beep,beep"   # leg1 hears this when a call is waiting (one playback, three beeps)
+IN2_REFUSED = "beep,beep"    # and this once the waiting call has been refused
 
 # Test D4. Conference factory addresses: {domain} is the SIP_DOMAIN global, {parent} the domain
 # without its first label, {mcc} and {mnc} come from --plmn (MNC padded to 3 digits). No real
@@ -214,6 +228,12 @@ WATCH_REC_SECS = 1000         # maxDurationSeconds cap: 8 kHz 16-bit audio is 16
 #                               second, so the 16 MB tmpfs holds about 1048 s
 WATCH_SILENT_DBFS = -55.0     # a second below this is silent: a quiet line or comfort noise
 #                               sits near -60 to -70 dBFS, and mu-law's smallest step is -72
+WATCH_DIGITAL_DBFS = -90.0    # a second below this is digital silence: almost every sample is
+#                               0 (an all-zero second reads LEVEL_FLOOR). It sits 18 dB under a
+#                               second of mu-law's smallest step, so line noise never reaches it
+WATCH_ZERO_RUN = 1.0          # s: a stretch of all-zero samples this long or longer is a switch
+#                               to digital silence; quiet line noise holds shorter runs of zero
+#                               samples (mu-law's two codes for 0)
 WATCH_LOUD_DBFS = -40.0       # a second at or above this is at tone or speech level: a network
 #                               tone of -10 dBm0 is about -16 dBFS, and a second in which
 #                               someone talks is about -20 to -35 dBFS
@@ -373,6 +393,36 @@ def level_runs(levels):
         else:
             runs.append([kind, i, i])
     return [tuple(r) for r in runs]
+
+
+def last_zero_switch(samples):
+    """The last switch from audio to digital silence in 8 kHz 16-bit audio: (start s, length s,
+    True if it runs to the end), or None. A switch is a stretch of all-zero samples at least
+    WATCH_ZERO_RUN s long that follows a non-zero sample; it starts just after that sample.
+    The audio is looked at in 10 ms blocks, then to the sample at the stretch's start."""
+    blk, n = DTMF_RATE // 100, len(samples)
+    zero = [not any(samples[i:i + blk]) for i in range(0, n, blk)]
+    need = math.ceil(WATCH_ZERO_RUN * 100)
+    found, i = None, 0
+    while i < len(zero):
+        if not zero[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(zero) and zero[j]:
+            j += 1
+        if i > 0 and j - i >= need:          # block i-1 holds a non-zero sample
+            found = (i, j)
+        i = j
+    if found is None:
+        return None
+    i, j = found
+    prev = samples[(i - 1) * blk:i * blk]
+    k = len(prev)
+    while k and prev[k - 1] == 0:
+        k -= 1
+    start, end = (i - 1) * blk + k, min(n, j * blk)
+    return start / DTMF_RATE, (end - start) / DTMF_RATE, end >= n
 
 
 def tone_summary(presses):
@@ -706,6 +756,7 @@ class TestD:
         self.hung_up = set()   # labels cleanup() has already hung up
         self.merge_at = None   # time.monotonic() when both REFERs had worked
         self.watch = None      # --watch-end while it runs and after (see end_watch)
+        self.in2 = None        # --in2, call waiting (see call_in_conf)
 
     # ---- results -------------------------------------------------------------------------
 
@@ -877,6 +928,10 @@ class TestD:
             # The carrier's hang-up (ast_queue_hangup_with_cause) carries a Q.850 cause. A
             # soft one (ast_softhangup, as for ARI's DELETE) carries a flag in that field.
             self.hangup_cause[label] = ev["cause"]
+        if (kind == "ChannelDtmfReceived" and self.in2 is not None
+                and label in ("leg1", "leg2")):
+            # --in2: kept here, so a key during a playback counts too; decide() reads them.
+            self.in2["keys"].append((label, str(ev.get("digit")), time.monotonic()))
         if label not in self.legs:
             return
         if kind == "StasisEnd" and label not in self.outside and label not in self.ended:
@@ -929,8 +984,9 @@ class TestD:
     # ---- building blocks -----------------------------------------------------------------
 
     def play(self, step, label, sound, wait=8.0):
+        """Play a sound, or several in one playback ("beep,beep"), to a leg."""
         ok, body = self.ari(step, "POST", f"/channels/{self.legs[label]}/play",
-                            media=f"sound:{sound}")
+                            media=",".join(f"sound:{s}" for s in sound.split(",")))
         if ok and body.get("id") and wait:
             pid = body["id"]
             self.wait_for(wait, lambda e: e.get("type") == "PlaybackFinished"
@@ -944,14 +1000,17 @@ class TestD:
             self.wait_for(wait, lambda e: e.get("type") == "PlaybackFinished"
                           and e.get("playback", {}).get("id") == pid)
 
-    def hangup(self, step, label, wait=5.0):
-        """Hang up a leg and wait up to `wait` s for its end. True if this hang-up ended it,
-        False if it had already gone."""
+    def hangup(self, step, label, wait=5.0, reason="normal"):
+        """Hang up a leg and wait up to `wait` s for its end. Returns whether ARI accepted the
+        DELETE: False if the leg had already gone or ARI refused, and True does not mean the
+        leg has ended (check self.ended). reason="busy" asks Asterisk to end an unanswered call
+        in with AST_CAUSE_BUSY (17), which chan_pjsip should send as 486 (from the 20.6
+        source; the trace confirms it)."""
         cid = self.legs.get(label)
         if not cid or label in self.ended:
             return False
         self.required.discard(label)
-        ok, _ = self.ari(step, "DELETE", f"/channels/{cid}", reason="normal")
+        ok, _ = self.ari(step, "DELETE", f"/channels/{cid}", reason=reason)
         if self.last_status == 404 and label not in self.ended:
             self.mark_ended(label, None, None, "404")
             self.log(f"{label} had already gone (DELETE -> 404), and ARI had sent no event for "
@@ -1086,20 +1145,25 @@ class TestD:
                       "Set HOME_PHONE_TEST_FORWARD in ../.env.", verdict="NOT RUN")
             self.play("tell leg1", "leg1", "beeperr")
             return
+        if self.opt.conf and self.opt.in2:
+            self.call_in_conf(forward)          # leg1 stays active until a key adds the caller
+            return
         self.play("start: beep to leg1", "leg1", "beep", wait=3)
-        self.must("D1a hold leg1 (re-INVITE a=sendonly)", "POST",
+        self.hold_leg1("D1a")
+        if self.opt.wait_in:
+            self.call_in()
+        else:
+            self.dial_out(forward)
+
+    def hold_leg1(self, tag, after=None):
+        """Hold leg1 (and start our music on hold with --moh). `after` names the pause line."""
+        self.must(f"{tag} hold leg1 (re-INVITE a=sendonly)", "POST",
                   f"/channels/{self.legs['leg1']}/hold")
-        self.pause("D1a")
+        self.pause(after or tag)
         if self.opt.moh:
             ok, _ = self.ari("D2 start our music on hold to leg1", "POST",
                              f"/channels/{self.legs['leg1']}/moh", mohClass="default")
             self.moh_on = ok
-        if self.opt.wait_in:
-            self.call_in()
-        elif self.opt.conf and self.opt.in2:
-            self.call_in_conf(forward)
-        else:
-            self.dial_out(forward)
 
     def dial_out(self, forward):
         self.step = "D1b second call"
@@ -1206,61 +1270,259 @@ class TestD:
         self.pause("E2 unhold leg1")
         self.join("E2")
 
+    # ---- Test D4 --in2: a second call in, in call-waiting order ----------------------------
+
+    def is_call_in(self, ev):
+        """A call in that the dialplan sent here while TESTD_WAIT=1 and that has no label."""
+        return (ev.get("type") == "StasisStart" and first_arg(ev) == "incoming"
+                and not self.label_of(channel_of(ev).get("id")))
+
+    def refuse_other(self, ev, why):
+        """Refuse a call in from another number with busy (cause 17; chan_pjsip should send
+        486)."""
+        number = re.sub(r"\D", "", str((channel_of(ev).get("caller") or {}).get("number") or ""))
+        self.in2["others"] += 1
+        self.log(f"D4-in2: the call in from a number ending in {number[-4:] or '(none)'} {why}: "
+                 "refusing it (busy)")
+        self.ari("D4-in2: refuse that call (busy)", "DELETE",
+                 f"/channels/{channel_of(ev).get('id')}", reason="busy")
+
     def call_in_conf(self, forward):
-        """D4 --in2: leg1 is held. Wait for a call in from the forward number (the dialplan
-        sends a test number or the forward number here while TESTD_WAIT=1, as for E2), answer
-        it as leg2 and go on as D4. A call in from any other number is refused with busy and
-        the wait goes on."""
+        """D4 --in2, in the order Ganpath will use. leg1 is an active call and stays so. The
+        script waits for a call in from the forward number (the dialplan sends a test number or
+        the forward number here while TESTD_WAIT=1, as for E2) and does not answer it: it
+        asks Asterisk to send it ringing and lets decide() ask leg1. A call in from another
+        test number is refused with busy and the wait goes on. TESTD_WAIT goes back to 0 once
+        leg2 rings, so after that no other call in reaches the script."""
+        s = self.in2 = {"keys": [], "others": 0, "arrived": None, "ring_at": None, "ring": "",
+                        "key": None, "key_at": None, "other_keys": [], "leg2_keys": [],
+                        "answered": False}
         self.step = "D4-in2 wait for a call in"
         if not self.set_flag("1", "D4-in2: set TESTD_WAIT=1 so the next call in comes here"):
             self.fail("D4-in2: ARI would not set TESTD_WAIT")
-            self.return_caller(failed=True)
+            self.play("D4-in2: play beeperr to leg1", "leg1", "beeperr")
             return
+        # Not waited for: a call in that came during the beep would be sent back.
+        self.play("D4-in2: beep to leg1: the forward number may call now", "leg1", "beep", wait=0)
         want = re.sub(r"\D", "", forward)[-10:]
-        self.log(f"D4-in2: call the landline now from the forward number. Waiting {WAIT_IN} s.")
-        end, ev, refused = time.monotonic() + WAIT_IN, None, 0
+        self.log(f"D4-in2: stay on the call on the test phone. The forward-number owner calls the "
+                 f"landline now. Waiting {WAIT_IN} s.")
+        end, ev = time.monotonic() + WAIT_IN, None
         while ev is None:
             left = end - time.monotonic()
             if left <= 0:
                 break
-            ev = self.wait_for(left, lambda e: e.get("type") == "StasisStart"
-                               and first_arg(e) == "incoming" and not self.label_of(
-                                   channel_of(e).get("id")))
+            ev = self.wait_for(left, self.is_call_in)
             if ev is None:
                 break
             number = re.sub(r"\D", "", str((channel_of(ev).get("caller") or {}).get("number")
                                            or ""))
             if number.endswith(want):
                 break
-            refused += 1
-            self.log(f"D4-in2: the call in from a number ending in {number[-4:] or '(none)'} is "
-                     "not the forward number: refusing it (busy) and waiting on")
-            self.ari("D4-in2: refuse that call (busy)", "DELETE",
-                     f"/channels/{channel_of(ev).get('id')}", reason="busy")
+            self.refuse_other(ev, "is not the forward number")
             ev = None
-        self.set_flag("0", "D4-in2: clear TESTD_WAIT")
         if ev is None:
+            self.set_flag("0", "D4-in2: clear TESTD_WAIT")
+            refused = s["others"]
             self.fail(f"D4-in2: no call in from the forward number reached the script in "
                       f"{WAIT_IN} s"
                       + (f" ({refused} call(s) in from another number were refused)" if refused
                          else "")
                       + ". Check the trace for a second INVITE and Asterisk's answer to it.")
-            self.return_caller(failed=True)
+            self.play("D4-in2: play beeperr to leg1", "leg1", "beeperr")
             return
+        s["arrived"] = time.monotonic()
         self.legs["leg2"] = channel_of(ev)["id"]
-        self.log("D4-in2: the forward number called in while leg1 was held")
+        self.step = "D4-in2 ring leg2"
+        ok, _ = self.ari("D4-in2: ring leg2 (Asterisk sends Airtel 180 or 183); it is not "
+                         "answered", "POST",
+                         f"/channels/{self.legs['leg2']}/ring")
+        s["ring_at"] = time.monotonic()
+        if not ok:
+            s["ring"] = self.last_error
+            self.log("D4-in2: Asterisk refused the ring, so it has sent Airtel no 180 or 183 for "
+                     "leg2; the script waits for a key all the same")
+        self.log(f"D4-in2: the forward number called in while leg1 was on an active call; leg2 "
+                 + ("is waiting unanswered, with no ring sent," if s["ring"] else
+                    "was sent ringing")
+                 + f" from {time.strftime('%H:%M:%S')}")
         self.subscribe("leg2")
+        self.set_flag("0", "D4-in2: clear TESTD_WAIT")
+        self.decide(forward)
+
+    def decide(self, forward):
+        """--in2: leg2 rings. Ask leg1 with three beeps and wait up to --in2-wait s for 1 (add
+        the caller) or 2 (refuse). Only leg1's keys count; leg2's are logged and ignored.
+        TESTD_WAIT is 0 by now, so the dialplan sends no other call here; one that got in
+        before it was cleared is sent back to the stage-1 dialplan by wait_for().
+        Key times are taken when the script reads the event, so a key pressed during an ARI
+        call (the ring, the subscribe, the beeps) is stamped up to that call's length late."""
+        s, secs = self.in2, self.opt.in2_wait
+        self.step = "D4-in2 ask leg1"
+        self.play("D4-in2: three beeps to leg1: a call is waiting", "leg1", IN2_CUE, wait=0)
+        self.log(f"D4-in2: a call is waiting. Press 1 on the test phone to add the caller, 2 to "
+                 f"refuse. Waiting {secs} s.")
+        self.step = "D4-in2 wait for a key from leg1"
+        end, seen = s["ring_at"] + secs, 0
+        while s["key"] is None:
+            while seen < len(s["keys"]) and s["key"] is None:
+                label, digit, at = s["keys"][seen]
+                seen += 1
+                after = at - s["ring_at"]
+                if after < 0:
+                    self.log(f"D4-in2: key {digit} from {label} came before the call was waiting: "
+                             "not counted")
+                elif label != "leg1":
+                    s["leg2_keys"].append(digit)
+                    self.log(f"D4-in2: key {digit} from {label} {after:.1f} s after the ring: "
+                             "ignored, only leg1 decides")
+                elif digit in ("1", "2"):
+                    s["key"], s["key_at"] = digit, after
+                    self.log(f"D4-in2: key {digit} from leg1 {after:.1f} s after the ring: "
+                             + ("adding the caller" if digit == "1" else "refusing the caller"))
+                else:
+                    s["other_keys"].append(digit)
+                    self.log(f"D4-in2: key {digit} from leg1 {after:.1f} s after the ring: not 1 "
+                             "or 2, waiting on")
+            if s["key"] is not None or "leg2" in self.ended:
+                break
+            left = end - time.monotonic()
+            if left <= 0:
+                self.log(f"D4-in2: no 1 or 2 from leg1 in {secs} s")
+                break
+            self.wait_for(left, lambda e: "leg2" in self.ended or len(s["keys"]) > seen)
+        if "leg2" in self.ended:
+            self.rang_out(held=False)
+        elif s["key"] == "1":
+            self.add_caller(forward)
+        else:
+            self.refuse_caller()
+
+    def add_caller(self, forward):
+        """--in2, key 1: hold leg1, answer leg2, then D4 from the hello-world to leg2."""
+        s = self.in2
+        self.required = {"leg1"}
+        self.step = "D4-in2 hold leg1"
+        self.hold_leg1("D4-in2", after="D4-in2 hold leg1")
+        if "leg2" in self.ended:
+            self.rang_out(held=True)
+            return
         self.step = "D4-in2 answer leg2"
         ok, _ = self.ari("D4-in2: answer leg2", "POST", f"/channels/{self.legs['leg2']}/answer")
         if not ok:
-            self.fail("D4-in2: could not answer the call in")
-            self.hangup("D4-in2 hang up leg2", "leg2")
+            if "leg2" not in self.ended:
+                self.wait_for(1.0, lambda e: "leg2" in self.ended)
+            if "leg2" in self.ended:
+                self.rang_out(held=True)
+                return
+            self.fail(f"D4-in2: could not answer the call in ({self.last_error})")
+            self.hangup("D4-in2: refuse leg2 with busy (cause 17)", "leg2", reason="busy")
             self.return_caller(failed=True)
             return
+        s["answered"] = True
         self.answered_at = time.monotonic()
+        self.log(f"D4-in2: leg2 answered {self.answered_at - s['ring_at']:.1f} s after the ring")
         self.required = {"leg1", "leg2"}
         self.pause("D4-in2 answer")
         self.conference(forward)
+
+    def keys_text(self):
+        """--in2: which keys came after the ring, for the RESULT."""
+        s = self.in2
+        parts = []
+        if s["other_keys"]:
+            parts.append(f"other keys from leg1: {' '.join(s['other_keys'])}")
+        if s["leg2_keys"]:
+            parts.append(f"keys from leg2, ignored: {' '.join(s['leg2_keys'])}")
+        if s["others"]:
+            parts.append(f"{s['others']} call(s) in from another number refused with busy")
+        if s["ring"]:
+            parts.append(f"Asterisk refused the ring ({s['ring']}), so it sent Airtel no 180 "
+                         "or 183")
+        return "; ".join(parts)
+
+    def refuse_caller(self):
+        """--in2, key 2 or no key in time: refuse leg2 with busy, tell leg1, ask what the
+        forward phone heard."""
+        s, secs = self.in2, self.opt.in2_wait
+        self.required = set()               # from here leg1 may hang up
+        self.step = "D4-in2 refuse leg2"
+        if s["key"] == "2":
+            how = (f"key 2 from leg1 {s['key_at']:.1f} s after the ring (keys reach the script "
+                   "on an active call)")
+        else:
+            how = (f"no 1 or 2 from leg1 in {secs} s"
+                   + (" (if 1 or 2 was pressed, keys do not reach the script on an active call)"
+                      if not s["other_keys"] else ""))
+        at = time.monotonic() - s["ring_at"]
+        refused = self.hangup("D4-in2: refuse leg2 with busy (cause 17)", "leg2", reason="busy")
+        if not refused and "leg2" in self.ended:
+            self.rang_out(held=False)       # it ended on its own just before the refusal
+            return
+        if not refused and "leg2" not in self.ended:
+            self.fail(f"D4-in2: {how}, but Asterisk would not refuse leg2 ({self.last_error})",
+                      verdict="STOPPED")
+            return
+        if "leg1" not in self.ended:
+            self.play("D4-in2: two beeps to leg1: the waiting call was refused", "leg1",
+                      IN2_REFUSED)
+        self.step = "D4-in2 question"
+        heard = self.ask("What did the forward phone hear, while it rang and after the refusal? A "
+                         "few words, for example: ringing, then a busy tone. Or press Enter to "
+                         "skip.")
+        extra = self.keys_text()
+        end = (self.end_str("leg2") if "leg2" in self.ended
+               else "ARI showed no end of leg2 within 5 s, see the trace")
+        self.passed(f"{how}: the script asked Asterisk to refuse the waiting call with busy "
+                    f"(cause 17; chan_pjsip should send 486, confirm in the trace) {at:.1f} s "
+                    f"after the ring; {end}. The forward phone heard: "
+                    f"{heard or 'not given'}." + (f" {extra[:1].upper()}{extra[1:]}." if extra
+                                                  else ""), verdict="REFUSED")
+
+    def rang_out(self, held):
+        """--in2: leg2 ended while it rang, before the script answered or refused it. Give leg1
+        back (held: it was already on hold for the merge) and ask who hung up."""
+        s = self.in2
+        if "leg2" in self.subscribed and self.end_how.get("leg2") != "destroyed":
+            # Its ChannelDestroyed, which carries the cause text, follows the StasisEnd.
+            self.wait_for(1.0, lambda e: self.end_how.get("leg2") == "destroyed")
+        secs = self.ended_at["leg2"] - s["arrived"]
+        cause, text = self.ended["leg2"]
+        why = (cause_str(cause, text) if cause is not None
+               else END_HOW.get(self.end_how.get("leg2"), "ARI gave no cause"))
+        self.log(f"D4-in2: leg2 ended while it rang, {secs:.1f} s after it reached the script "
+                 f"({why})")
+        self.required = set()
+        if held:
+            self.return_caller(failed=True)
+        elif "leg1" not in self.ended:
+            self.play("D4-in2: play beeperr to leg1", "leg1", "beeperr")
+        self.step = "D4-in2 question"
+        hung = self.ask_yn("Did the forward-number owner hang up while the call rang? y/n")
+        base = (f"D4-in2: leg2 ended while it rang, {secs:.1f} s after it reached the script and "
+                + ("after key 1 from leg1, " if held else "")
+                + f"before the script answered it ({why}), so nothing was merged")
+        extra = self.keys_text()
+        base += f"; {extra}" if extra else ""
+        if hung == "y":
+            self.fail(f"{base}. The forward-number owner hung up.", verdict="STOPPED")
+        elif hung == "n":
+            self.passed(f"{base}. The forward-number owner did not hang up, so something else "
+                        f"ended the waiting call after {secs:.1f} s: a CANCEL from the carrier "
+                        "side or the caller's network, or Asterisk itself. The trace shows "
+                        "which, with the CANCEL's Reason header.", verdict="UNCLEAR")
+        else:
+            self.passed(f"{base}. Nobody said at the terminal whether the forward-number owner "
+                        "hung up: the trace shows who sent the CANCEL.", verdict="UNCLEAR")
+
+    def in2_text(self):
+        """--in2 once key 1 has had leg2 answered: the call-waiting sentence for the RESULT."""
+        s = self.in2
+        extra = self.keys_text()
+        how = ("waited unanswered, with no ring sent," if s["ring"] else "was sent ringing")
+        return (f"Call waiting: leg2 {how} until key 1 from leg1 {s['key_at']:.1f} s after the "
+                "ring (keys reach the script on an active call)"
+                + (f"; {extra}" if extra else "") + ".")
 
     def join(self, tag):
         self.step = f"{tag} join"
@@ -2276,6 +2538,27 @@ class TestD:
         if w["end_at"] and t_end < w["end_at"] - WATCH_GAP and not gap > WATCH_GAP:
             notes.append(f"the recording stopped {w['end_at'] - t_end:.0f} s before the watch "
                          "ended")
+        # The last switch to digital silence, over the whole file: the phones' audio stops
+        # reaching the conference (12 Nov: about 20 s before Enter, when both had hung up).
+        switch = last_zero_switch(samples)
+        if switch is None:
+            zero = (f"no switch from audio to all-zero samples ({WATCH_ZERO_RUN:g} s or longer) "
+                    "in the recording")
+        else:
+            start, length, to_end = switch
+            rel = start - (ref - t0)
+            if gap > WATCH_GAP:
+                # Enter is placed by the clock; missing audio before it moves it earlier in the
+                # file, so the switch may be up to that much later relative to it.
+                rel_text = (f"{abs(rel):.1f} s {'after' if rel >= 0 else 'before'} {ref_name} "
+                            f"by the clock (it may be up to {min(gap, max(0.0, ref - t0)):.0f} s later "
+                            "relative to it, see the missing-audio note)")
+            else:
+                rel_text = f"{abs(rel):.1f} s {'after' if rel >= 0 else 'before'} {ref_name}"
+            zero = (f"the last switch from audio to all-zero samples came {start:.1f} s into "
+                    f"the recording, {rel_text}, and the zeros "
+                    + ("ran to the end of the file" if to_end else f"lasted {length:.1f} s"))
+        self.log(f"D4 end watch: {zero}")
         after = levels[k:]
         if not after:
             text = (f"none: the file ends before {k} s" if gap > WATCH_GAP
@@ -2284,15 +2567,18 @@ class TestD:
             runs = level_runs(after)
             count = {kind: sum(b - a + 1 for kk, a, b in runs if kk == kind)
                      for kind in ("silent", "low", "loud")}
+            digital = sum(1 for v in after if v < WATCH_DIGITAL_DBFS)
             longest = max([b - a + 1 for kk, a, b in runs if kk == "silent"], default=0)
             shape = ", ".join(f"{kind} {a}-{b} s" if b > a else f"{kind} {a} s"
                               for kind, a, b in runs[:WATCH_RUNS])
             if len(runs) > WATCH_RUNS:
                 shape += f", {len(runs) - WATCH_RUNS} more runs"
             text = (f"{len(after)} s recorded: silent {count['silent']} s (below "
-                    f"{WATCH_SILENT_DBFS:g} dBFS), low {count['low']} s, tone or speech level "
-                    f"{count['loud']} s (at or above {WATCH_LOUD_DBFS:g} dBFS; loudest "
+                    f"{WATCH_SILENT_DBFS:g} dBFS; {digital} s of them digital silence, all-zero "
+                    f"or below {WATCH_DIGITAL_DBFS:g} dBFS), low {count['low']} s, tone or speech "
+                    f"level {count['loud']} s (at or above {WATCH_LOUD_DBFS:g} dBFS; loudest "
                     f"{max(after):.0f} dBFS), longest silent run {longest} s; in order: {shape}")
+        text += f"; {zero}"
         if notes:
             text += "; " + "; ".join(notes)
         w["audio"] = f"{head}: {text}."
@@ -2634,8 +2920,12 @@ class TestD:
         for label in reversed(list(self.legs)):
             cid = self.legs.get(label)
             if cid and label not in self.ended and label not in self.hung_up:
-                self.ari(f"cleanup: hang up {label}", "DELETE", f"/channels/{cid}",
-                         reason="normal", http_timeout=3)
+                # An --in2 leg2 that was never answered is still ringing: refuse it with busy.
+                ringing = label == "leg2" and self.in2 is not None and not self.in2["answered"]
+                self.ari(f"cleanup: hang up {label}" + (" with busy, it was still ringing"
+                                                        if ringing else ""),
+                         "DELETE", f"/channels/{cid}", reason="busy" if ringing else "normal",
+                         http_timeout=3)
         if self.ws:
             self.ws.close()
 
@@ -2671,12 +2961,15 @@ class TestD:
                 self.log(f"cleanup error: {e!r}")
             if self.verdict is None:
                 self.verdict, self.detail = "STOPPED", f"no result reached ({self.step})"
+            merging = self.in2 is None or self.in2["answered"]   # --in2: leg2 was answered
+            if self.in2 is not None and self.in2["answered"]:
+                self.add_sentence(self.in2_text())
             if self.opt.conf and self.opt.watch_end is not None:
                 text = self.watch_text()
                 if text:
                     self.add_sentence(text)
             if self.verdict in ("PASS", "FAIL", "UNCLEAR"):
-                if self.opt.conf:
+                if self.opt.conf and merging:
                     self.add_sentence("The script does not judge voices: the audio verdict is "
                                       "the testers'.")
                 elif self.opt.probe and self.verdict != "FAIL":
@@ -2688,7 +2981,7 @@ class TestD:
                 if text:
                     self.add_sentence(text)
             self.log(f"RESULT: {self.mode} {self.verdict}: {self.detail}")
-        if self.verdict == "PASS":
+        if self.verdict in ("PASS", "REFUSED"):     # REFUSED: --in2 refused the call, as asked
             code = 0
         return code
 
@@ -2761,9 +3054,15 @@ def main():
                          "the merge to the end of the watch and is summarised as per-second "
                          "levels. Not with --flash or --hold-leg3")
     d4.add_argument("--in2", action="store_true",
-                    help="--conf: leg2 is a call in from the forward number while leg1 is held "
-                         f"(waits {WAIT_IN} s, as E2), not a call out. Reported as D4-in2. Not "
-                         "with --flash or --dial-out")
+                    help="--conf: leg2 is a call in from the forward number, in call-waiting "
+                         f"order: leg1 stays active, the script waits {WAIT_IN} s for the call, "
+                         "keeps it ringing and asks leg1 with three beeps; 1 adds it (hold leg1, "
+                         "answer leg2, then as D4), 2 or no key refuses it with busy. Reported "
+                         "as D4-in2. Not with --flash or --dial-out")
+    d4.add_argument("--in2-wait", type=int, metavar="S",
+                    help="--conf --in2: how long leg2 rings while the script waits for 1 or 2 "
+                         f"from leg1 (default {IN2_WAIT}, {IN2_WAIT_RANGE[0]} to "
+                         f"{IN2_WAIT_RANGE[1]})")
     d4.add_argument("--no-key-check", action="store_true",
                     help="--conf: do not record the conference audio during the talk, so no "
                          "search for key tones (keypad events on leg3 are still logged). With "
@@ -2784,6 +3083,7 @@ def main():
             ("--no-drop", opt.no_drop, opt.conf, "--conf"),
             ("--watch-end", opt.watch_end is not None, opt.conf, "--conf"),
             ("--in2", opt.in2, opt.conf, "--conf"),
+            ("--in2-wait", opt.in2_wait is not None, opt.conf and opt.in2, "--conf --in2"),
             ("--no-key-check", opt.no_key_check, opt.conf, "--conf")):
         if given and not allowed:
             ap.error(f"{flag} works only with {where}")
@@ -2798,6 +3098,10 @@ def main():
     if opt.in2 and opt.dial_out:
         ap.error("--in2 does not go with --dial-out: --dial-out hangs up leg2, so no incoming "
                  "dialog would be merged")
+    if opt.in2_wait is None:
+        opt.in2_wait = IN2_WAIT
+    elif not IN2_WAIT_RANGE[0] <= opt.in2_wait <= IN2_WAIT_RANGE[1]:
+        ap.error(f"--in2-wait takes {IN2_WAIT_RANGE[0]} to {IN2_WAIT_RANGE[1]} seconds")
     if opt.watch_end is not None:
         if opt.flash:
             ap.error("--watch-end does not go with --flash: there leg3 is the flash call, not a "

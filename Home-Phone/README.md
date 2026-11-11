@@ -372,7 +372,7 @@ Each fallback run is its own call, chosen by the result before it:
 | `--no-drop` | You want the conference to stay up at the end. | No drop test. The script stays on the conference until it ends (for example when both testers hang up), Ctrl-C, or 300 s, then leaves. The key check still ends with the talk. |
 | `--hold-leg3 [S]` (with `--no-drop`) | Run 2 of the line check (below). | Before the stay, on Enter, the script holds leg3 for S s (default 10), takes it off hold, plays a beep into the conference and asks what you heard. Not with `--flash`. |
 | `--watch-end [S]` | [End of a merged call](#end-of-a-merged-call). | No drop test. After the heard question both testers hang up and press Enter. The script keeps leg3 up for S s (default 180, 10 to 900) and logs whether Airtel ends it. The recording runs until the watch ends and is summarised as levels. Not with `--flash` or `--hold-leg3`. |
-| `--in2` | [Incoming second call](#incoming-second-call). | leg2 is a call in from the forward number while you are held, not a call out. The RESULT says `D4-in2`. Not with `--flash` or `--dial-out`. |
+| `--in2 [--in2-wait S]` | [Incoming second call](#incoming-second-call). | leg2 is a call in from the forward number, in call-waiting order: you stay on an active call, the script keeps the second call ringing and you press 1 to add it or 2 to refuse it (S s to decide, default 20, 5 to 120). The RESULT says `D4-in2`. Not with `--flash` or `--dial-out`. |
 | `--no-key-check` | Someone on the call does not want it recorded, or the key question is already answered. | No snoop channel and no recording. Keypad events on leg3 are still logged, and the RESULT says `Key check: off`. With `--watch-end` the recording still runs, for the levels only. |
 | `--moh` | As in D2. | Our music plays to you until your call's REFER (with `--flash`, until the flash INVITE). |
 
@@ -522,45 +522,61 @@ The audio after Enter, in the same sentence:
 
 | Part | Meaning |
 |---|---|
-| `silent N s (below -55 dBFS)` | Seconds of nothing but line noise. |
+| `silent N s (below -55 dBFS; D s of them digital silence, all-zero or below -90 dBFS)` | Seconds of nothing but line noise. D of them carry no noise at all: every sample, or nearly every one, is 0. Line noise and comfort noise never go that low, so digital silence means no audio is being mixed into leg3 any more. |
 | `low N s` | Seconds between -55 and -40 dBFS: hiss, comfort noise or a faint sound. |
 | `tone or speech level N s (at or above -40 dBFS; loudest L dBFS)` | Seconds with a tone, a message or a voice. A network tone sits near -16 dBFS. |
 | `longest silent run N s` | The longest stretch of silent seconds after Enter. |
 | `in order: loud 0-5 s, silent 6-179 s` | Each run in seconds after Enter. This gives the shape: a message and then silence, silence throughout, or sound that goes on. |
+| `the last switch from audio to all-zero samples came T s into the recording, N s before Enter, and the zeros ran to the end of the file` | Where in the whole recording the audio last changed to all-zero samples (1 s or longer; shorter stretches of zeros happen in quiet line noise). On 12 Nov this came about 20 s before Enter, when both phones had hung up, and the zeros ran to the end. `the zeros lasted L s` means audio came back after them. `no switch from audio to all-zero samples` means the recording never went fully silent. When the file holds less audio than the time it ran, `N s before Enter` gains `by the clock (it may be up to G s later relative to it, see the missing-audio note)`: T is exact, but Enter's place in the file is not. |
 | `the file holds N s less audio than the T s it ran` | For that long no audio packets came from Airtel. Asterisk writes nothing when no RTP arrives, so the file is shorter than the watch, and the seconds after such a stretch count early. The file does not show when the stretch was. After Enter it means the conference stopped sending audio. |
 | `Audio from K s into the file, where Enter falls only if no audio was missing before it ...` | Shown in place of `Audio after Enter` when the file holds less audio than the time it ran. The script places Enter in the file by the clock, so any missing audio before Enter puts Enter earlier in the file than K s. The summary may then leave out up to that much audio just after Enter, and the counts then cover less than the time after Enter. Use the per-second levels in the log to judge it. |
 | `none: the recording ended before Enter` | leg3 ended before Enter, and the recording with it. With missing audio it reads `none: the file ends before K s`. |
 | `No audio summary: ...` | The recording did not run or could not be read. The leg3 timing still stands. |
 
-The two levels are fixed in `tests/testd.py` (`WATCH_SILENT_DBFS`, `WATCH_LOUD_DBFS`). The service will have its own settings.
+The levels are fixed in `tests/testd.py` (`WATCH_SILENT_DBFS`, `WATCH_LOUD_DBFS`, `WATCH_DIGITAL_DBFS`, and `WATCH_ZERO_RUN` for the shortest stretch of zeros that counts). The service will have its own settings.
 
 ### Incoming second call
 
-Every D4 so far dialled leg2 out. Ganpath also has to merge a call that comes in while it holds a family member. `--in2` tests that. leg2 is then a call in from the forward number, as in E2.
+Every D4 so far dialled leg2 out. Ganpath also has to merge a call that comes in while a family member is on a normal call with it. `--in2` tests that, in the order Ganpath will use. The first call stays active, with no hold. The second call comes in from the forward number, and Asterisk keeps it ringing (call waiting). The script asks the person on the call whether to add it. On yes it holds leg1, answers leg2, holds leg2 and merges both through the conference factory, as D4 does. On no, or no answer in time, the second call gets busy.
 
 ```bash
 python3 tests/testd.py --conf --conf-uri '<the URI D4a found>' --in2
 ```
-It works with `--no-drop`, `--watch-end`, `--refer-in legs`, `--moh` and `--no-key-check`, and not with `--flash` or `--dial-out`. The RESULT line says `D4-in2`.
+`--in2-wait S` sets how long the second call rings while the script waits for a key: 5 to 120 s, 20 by default. `--in2` works with `--no-drop`, `--watch-end`, `--refer-in legs`, `--moh` and `--no-key-check`, and not with `--flash` or `--dial-out`. The RESULT line says `D4-in2`.
 
 Steps:
-1. Call the landline from a test number and press 4 after the beep. The script holds you.
-2. The terminal shows `D4-in2: call the landline now from the forward number. Waiting 60 s.` The forward-number owner calls the landline.
-3. The script answers that call, plays it hello-world and holds it. Then it calls the conference factory and sends the REFERs, leg2 first and then leg1, as in D4.
-4. Talk, the key check and the questions go as in D4.
+1. Call the landline from a test number and press 4 after the beep. Stay on the call. The script does not hold you.
+2. You hear one beep, and the terminal shows `D4-in2: stay on the call on the test phone. The forward-number owner calls the landline now. Waiting 60 s.` The forward-number owner calls the landline.
+3. The script does not answer that call. It asks Asterisk to send it ringing (180 or 183, depending on the endpoint's `inband_progress`; the trace shows which) and logs the time. You hear three beeps, and the terminal shows `Press 1 on the test phone to add the caller, 2 to refuse.`
+4. Press 1 or 2 on the test phone within 20 s (or the `--in2-wait` time).
+   - 1: the script holds you, answers the second call, plays it hello-world and holds it. Then it calls the conference factory and sends the REFERs, leg2 first and then leg1, as in D4. Talk, the key check and the questions go as in D4.
+   - 2, or no key in time: the script asks Asterisk to refuse the second call with busy (cause 17, which chan_pjsip should send as `486 Busy Here`; the trace confirms it). You hear two beeps. The terminal then asks what the forward phone heard. Type a few words and press Enter, or just press Enter. The run ends there.
+5. If the second call stops ringing before the script answers or refuses it, the script logs after how many seconds. You hear an error beep, and the terminal asks whether the forward-number owner hung up. Answer y or n.
+
+The script logs every key with its leg. Only keys from the test phone (leg1) count. Keys from the forward phone (leg2) are logged and ignored, and so are keys pressed before the second call arrived. A key other than 1 or 2 is logged and the wait goes on. So the run also shows whether keys reach the script during a normal active call. Key times are taken when the script reads the event, not when Asterisk sends it. A key pressed while the script waits on an ARI call (the ring, the subscribe, the beeps) is stamped late by up to that call's length, usually milliseconds. A key pressed in the moment between the call arriving and the ring request can therefore count as after the ring.
 
 What each tester hears:
-- You: the beep, then Airtel's hold message for the whole wait, then hello-world and the other voice.
-- The forward-number owner: the call is answered with hello-world, then Airtel's hold message, then hello-world again and your voice.
+- You: the beep after pressing 4, silence (the script does not talk), one beep when the forward-number owner should call, three beeps when the call is waiting. After 1: Airtel's hold message, then hello-world and the other voice. After 2 or no key: two beeps. The script hangs up your call when the run ends.
+- The forward-number owner: ringing (or whatever Airtel plays to a caller who is waiting). After 1: hello-world, then Airtel's hold message, then hello-world again and your voice. After 2 or no key: a busy tone or an Airtel message. Note what it was for the terminal question.
 
-Only the forward number counts. While the script waits, the dialplan sends it a call in from a test number or the forward number, as in E2. The script refuses any other number with busy, logs its last 4 digits and waits on.
+Only the forward number counts as the second call. While the script waits, the dialplan sends it a call in from a test number or the forward number, as in E2; any other number just rings. The script refuses another test number with busy, logs its last 4 digits and waits on. Once the second call rings, the script sets `TESTD_WAIT` back to 0, so a further call in gets the normal stage-1 handling and never reaches the script. `Ctrl-C` while the second call rings stops the run, and the cleanup refuses that call with busy.
 
 | RESULT | Meaning |
 |---|---|
-| `D4-in2 PASS` | Airtel merged a call that came in. The `D4 leg2 dialog` line shows its tags: `ours` is the To-tag of our `200 OK`, `theirs` the From-tag of Airtel's INVITE. |
+| `D4-in2 PASS: ... Call waiting: leg2 was sent ringing until key 1 from leg1 N s after the ring` | Airtel merged a call that had been kept ringing while leg1 was active. `waited unanswered, with no ring sent,` in place of `was sent ringing` means Asterisk refused the ring request. The `D4 leg2 dialog` line shows its tags: `ours` is the To-tag of our `200 OK`, `theirs` the From-tag of Airtel's INVITE. |
+| `D4-in2 REFUSED: key 2 from leg1 N s after the ring ...: the script asked Asterisk to refuse the waiting call with busy (cause 17; chan_pjsip should send 486, confirm in the trace) ... The forward phone heard: ...` | The refusal path worked as far as ARI shows. The trace shows the SIP answer Airtel got, and the forward-number owner's words show what a refused caller hears from Airtel. |
+| `D4-in2 REFUSED: no 1 or 2 from leg1 in S s` | No key came in time, so the script refused the call. `(if 1 or 2 was pressed, keys do not reach the script on an active call)` is added when no key came from leg1 at all. If you did press 1 or 2, keys do not reach the script during an active call: check the trace for RFC 4733 events on leg1. |
+| `Other keys from leg1: ...`, `keys from leg2, ignored: ...` | Keys that came in the wait and were not used. |
+| `leg2 ended while it rang, N s after it reached the script ... The forward-number owner did not hang up, so something else ended the waiting call after N s` (UNCLEAR) | A measurement, not a failure. The trace shows who ended it: a CANCEL from the carrier side (with its Reason header) or the caller's network, or Asterisk. If it was a CANCEL from the carrier side, a waiting call rings no longer than N s, so the time Ganpath takes to ask has to fit inside it. |
+| `... The forward-number owner hung up.` (STOPPED) | The caller gave up. Nothing was merged. Run it again. |
+| `... Nobody said at the terminal ...` (UNCLEAR) | The question got no answer. The trace shows who sent the CANCEL. |
+| `... after key 1 from leg1, before the script answered it` | The second call ended between the key and the answer. The script took leg1 off hold again. |
+| `Asterisk refused the ring ..., so it sent Airtel no 180 or 183` | ARI refused the ring request. The run went on without it. |
 | `no call in from the forward number reached the script in 60 s` | The second call never reached the script. Check the trace for a second INVITE and Asterisk's answer. `(N call(s) in from another number were refused)` means a call came from another phone. |
 | `FAILURE 481` on leg2 | `Replaces` did not match for the incoming call. The `Refer-To` carries `to-tag=theirs;from-tag=ours`, as for leg1. If leg1 moved in an earlier D4 run, the tag order is right and the proxy rewrote something for this call. |
 | Anything else | As under [Reading the D4 results](#reading-the-d4-results). |
+
+The exit code is 0 for PASS and REFUSED.
 
 ## Asterisk 22.12 (stage 2, phase 7)
 
