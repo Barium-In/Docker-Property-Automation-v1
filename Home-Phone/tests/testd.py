@@ -28,6 +28,9 @@ Modes, one per run (--moh can be added to any of them):
                 leg1 is held and leg2 is active, INVITE a switching-order address (default
                 sip:flash@<domain>) as leg3, watch for Airtel's re-INVITEs, then ask the same
                 questions.
+  --conf --no-drop --hold-leg3 [S]  D4, then stay on the conference; on Enter, hold leg3 for
+                S s (default 10), take it off hold, beep into the conference and ask what the
+                testers heard: whether a held leg3 rejoins Airtel's conference.
 In a 3-way, * on either phone plays a beep and # ends the test.
 If the carrier holds a leg from its side (a ChannelHold event: its answer to an unhold, or its
 own re-INVITE, carried a=sendonly or a=inactive) and the leg is still held when the test
@@ -1604,14 +1607,16 @@ class TestD:
             return line.strip()
         return None
 
-    def ask(self, question, limit=ASK_WAIT, talk=False):
+    def ask(self, question, limit=ASK_WAIT, talk=False, until=None):
         """One line from the terminal (lower case), while ARI events keep being handled. None at
-        the end of input or after `limit` s. In the talk, # on leg3 ends it (returns '#') and
-        * plays a beep into the conference."""
+        the end of input, after `limit` s, or once until() is true. In the talk, # on leg3 ends
+        it (returns '#') and * plays a beep into the conference."""
         if question:
             self.log(question)
         end = time.monotonic() + limit
         while True:
+            if until is not None and until():
+                return None
             line = self.typed_line()
             if line is not None:
                 self.log(f"typed: {line!r}" if line else "typed: Enter")
@@ -1926,6 +1931,17 @@ class TestD:
         is already set, so a Ctrl-C here only ends the stay."""
         if "leg3" not in self.legs or "leg3" in self.ended:
             return
+        if self.opt.hold_leg3:
+            try:
+                reported = self.hold_check(self.opt.hold_leg3)
+            except KeyboardInterrupt:
+                self.log("D4 leg3 hold check: stopped with Ctrl-C, leaving the conference")
+                self.add_sentence("The leg3 hold check was stopped with Ctrl-C.")
+                return
+            if "leg3" in self.ended:
+                if not reported:
+                    self.add_sentence(f"During the leg3 hold check: {self.end_str('leg3')}.")
+                return
         self.step = "D4 stay on the conference"
         self.log(f"D4 --no-drop: staying on the conference for up to {TALK_LIMIT} s. Hang up "
                  "both phones, or press Ctrl-C here to leave it.")
@@ -1939,6 +1955,68 @@ class TestD:
         secs = int(time.monotonic() - start)
         self.log(f"D4 --no-drop: left the conference after {secs} s ({how})")
         self.detail += f" With --no-drop the script stayed on the conference {secs} s, until {how}."
+
+    def hold_check(self, secs):
+        """--hold-leg3: on Enter, hold leg3 for `secs` s, take it off hold, play a beep into
+        the conference and ask what the testers heard. Ganpath would hold leg3 like this to
+        take a second call during a merged call, so this shows whether the parties hear
+        Airtel's hold message and whether a held leg3 rejoins. The result is already set; this
+        adds a sentence only. True if it has already reported that leg3 ended."""
+        gone = lambda: "leg3" in self.ended         # noqa: E731
+        self.step = "D4 leg3 hold check"
+        answer = self.ask(
+            "D4 leg3 hold check. Keep both phones on the call. For the line check with leg3 "
+            "still up, call the landline now from the third phone, note what it hears, and hang "
+            f"it up. Then press Enter here to put leg3 on hold for {secs} s, or type s to skip. "
+            "While leg3 is held, both testers note what they hear.",
+            limit=TALK_LIMIT, until=gone)
+        if gone():
+            return False                        # stay() reports how leg3 ended
+        if answer is None or answer.startswith("s"):
+            self.log("D4 leg3 hold check: skipped")
+            self.add_sentence("Leg3 hold check: skipped.")
+            return False
+        ok, _ = self.ari(f"D4 leg3 hold check: hold leg3 for {secs} s (re-INVITE a=sendonly)",
+                         "POST", f"/channels/{self.legs['leg3']}/hold")
+        if not ok:
+            self.add_sentence(f"Leg3 hold check: Asterisk refused the hold ({self.last_error}), "
+                              "so nothing reached the focus.")
+            return False
+        self.wait_for(secs, lambda e: gone())
+        if gone():
+            self.add_sentence(f"Leg3 hold check: {self.end_str('leg3')} while it was on hold.")
+            return True
+        focus_held = "leg3" in self.net_held
+        ok, _ = self.ari("D4 leg3 hold check: take leg3 off hold (re-INVITE a=sendrecv)",
+                         "DELETE", f"/channels/{self.legs['leg3']}/hold")
+        unhold = "sent" if ok else f"refused by Asterisk ({self.last_error})"
+        self.wait_for(self.opt.pause, lambda e: gone())
+        if gone():
+            self.add_sentence(f"Leg3 hold check: {self.end_str('leg3')} after the unhold.")
+            return True
+        still_held = "leg3" in self.net_held
+        beep = self.play("D4 leg3 hold check: play a beep into the conference", "leg3", "beep")
+        heard = self.ask("What did each phone hear while leg3 was held? A few words, for "
+                         "example: Airtel's hold message on both, music, silence, each other. "
+                         "Or press Enter to skip.", until=gone)
+        talking = beep_heard = None
+        if not gone():
+            talking = self.ask_yn("Can the two phones still hear each other? y/n")
+        if not gone():
+            beep_heard = self.ask_yn("Did both phones hear a beep after the unhold? y/n")
+        self.log(f"D4 leg3 hold check: done (still talking: {talking or 'no answer'}, "
+                 f"beep heard: {beep_heard or 'no answer'})")
+        self.add_sentence(
+            f"Leg3 hold check ({secs} s): "
+            + ("the focus's answer held leg3 from its side during the hold"
+               if focus_held else "the focus raised no hold of its own")
+            + f"; unhold {unhold}; afterwards leg3 was "
+            + ("still held by the focus" if still_held else "not held")
+            + ("" if beep else "; Asterisk would not play the beep")
+            + f"; heard while held: {heard or 'not given'}"
+            + f"; still talking after: {talking or 'no answer'}"
+            + f"; beep heard: {beep_heard or 'no answer'}.")
+        return False
 
     # ---- Test D4: the key check -----------------------------------------------------------
 
@@ -2303,6 +2381,10 @@ def main():
     d4.add_argument("--no-drop", action="store_true",
                     help="--conf: skip the drop test and stay on the conference until it ends, "
                          f"Ctrl-C or {TALK_LIMIT} s")
+    d4.add_argument("--hold-leg3", type=int, nargs="?", const=10, metavar="S",
+                    help="--conf --no-drop: before the stay, on Enter, hold leg3 for S s "
+                         "(default 10), take it off hold, play a beep into the conference and "
+                         "ask what the phones heard")
     d4.add_argument("--no-key-check", action="store_true",
                     help="--conf: do not record the conference audio during the talk, so no "
                          "search for key tones (keypad events on leg3 are still logged)")
@@ -2328,6 +2410,14 @@ def main():
                  "calls the party, so there is no party dialog to send the REFER in")
     if opt.flash and (opt.dial_out or opt.refer_in):
         ap.error("--flash sends no REFER, so --dial-out and --refer-in do not go with it")
+    if opt.hold_leg3 is not None:
+        if not opt.no_drop:
+            ap.error("--hold-leg3 works only with --conf --no-drop")
+        if opt.flash:
+            ap.error("--hold-leg3 does not go with --flash: there leg3 is the flash call, not "
+                     "a leg in Airtel's conference")
+        if not 1 <= opt.hold_leg3 <= 120:
+            ap.error("--hold-leg3 takes 1 to 120 seconds")
     if opt.plmn and not PLMN_OK.fullmatch(opt.plmn):
         ap.error("--plmn takes MCC-MNC: three digits, a dash, then two or three digits")
     opt.refer_in = opt.refer_in or "focus"

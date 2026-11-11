@@ -370,6 +370,7 @@ Each fallback run is its own call, chosen by the result before it:
 | `--flash` | In every D4 session (step 5 above). | TS 183 043 C.14.3: no hold of the mobile and no REFER. With you held and the mobile active, the script INVITEs `sip:flash@{domain}` (or the first `--conf-uri`) as leg3 and waits 5 s for Airtel to join the calls. The script keeps your call and the mobile's until the drop test. |
 | `--icsi` | Repeat the best run with it. | Adds the MMTEL `Accept-Contact` and `P-Preferred-Service` headers to the factory or flash INVITE. |
 | `--no-drop` | You want the conference to stay up at the end. | No drop test. The script stays on the conference until it ends (for example when both testers hang up), Ctrl-C, or 300 s, then leaves. The key check still ends with the talk. |
+| `--hold-leg3 [S]` (with `--no-drop`) | Run 2 of the line check (below). | Before the stay, on Enter, the script holds leg3 for S s (default 10), takes it off hold, plays a beep into the conference and asks what you heard. Not with `--flash`. |
 | `--no-key-check` | Someone on the call does not want it recorded, or the key question is already answered. | No snoop channel and no recording. Keypad events on leg3 are still logged, and the RESULT says `Key check: off`. |
 | `--moh` | As in D2. | Our music plays to you until your call's REFER (with `--flash`, until the flash INVITE). |
 
@@ -447,15 +448,31 @@ Other D4 results:
 
 ### Line check during a merged call
 
-This answers one question for a later session, with no code change: while Airtel's conference holds the merged call, does the line take a new call? It needs a third phone that is not one of the two in the call, and not a SIP app such as Zoiper, which would take the line over.
+This answers one question for a later session: while Airtel's conference holds the merged call, does the line take a new call? It needs a third phone that is not one of the two in the call, and not a SIP app such as Zoiper, which would take the line over. Do it twice: once after leg3 has left the merged call, and once with leg3 still on it.
 
+**Run 1, after leg3 has left.**
 1. Run D4 as usual (`--conf --conf-uri '<the URI D4a found>'`).
 2. Answer the drop question. If the answer is `y`, keep both phones talking. If it is `n`, the merged call has ended and there is nothing to check: skip the steps below.
 3. Call the landline from the third phone.
-4. On den-ubuntu:
+4. Run the log check below.
+
+**Run 2, with leg3 still up, and the leg3 hold check.** Ganpath would put leg3 on hold to take a second call during a merged call, so this run also holds leg3 for 10 s and asks what you heard.
+1. Run D4 with `--no-drop --hold-leg3` (and `--no-key-check` if run 1 already did the key check):
    ```bash
-   docker logs --since 5m home-phone 2>&1 | grep -E "Incoming call|Not a test caller"
+   python3 tests/testd.py --conf --conf-uri '<the URI D4a found>' --no-drop --hold-leg3 --no-key-check
    ```
+2. Talk, press Enter and answer the heard question as usual. The script then stays on the conference and prints `D4 leg3 hold check. Keep both phones on the call.`
+3. Call the landline from the third phone, note what it hears, hang it up, and run the log check below in a second terminal.
+4. Press Enter in the script's terminal. It holds leg3 for 10 s (`--hold-leg3 S` sets another length, 1 to 120 s). Both testers note what they hear while leg3 is held: Airtel's hold message, music, silence, or each other.
+5. The script takes leg3 off hold, plays a beep into the conference, and asks three questions: what each phone heard while leg3 was held, whether the two phones still hear each other, and whether both heard the beep.
+6. Hang up both phones, or press Ctrl-C, to end the stay.
+
+The RESULT line gets a `Leg3 hold check` sentence: whether the conference's answer held leg3 from its side, whether leg3 was still held after the unhold, and your three answers. Like the key check, it never changes PASS, FAIL or UNCLEAR. Type `s` instead of Enter at step 4 to skip the hold.
+
+**The log check.** On den-ubuntu:
+```bash
+docker logs --since 5m home-phone 2>&1 | grep -E "Incoming call|Not a test caller"
+```
 
 | What you see | Meaning |
 |---|---|
