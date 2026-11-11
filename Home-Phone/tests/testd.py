@@ -31,6 +31,14 @@ Modes, one per run (--moh can be added to any of them):
   --conf --no-drop --hold-leg3 [S]  D4, then stay on the conference; on Enter, hold leg3 for
                 S s (default 10), take it off hold, beep into the conference and ask what the
                 testers heard: whether a held leg3 rejoins Airtel's conference.
+  --conf --watch-end [S]  D4, then the end-of-merge check, with no drop test: after the heard
+                question both testers hang up and press Enter, and the script keeps leg3 up
+                for S s (default 180) and logs whether and when Airtel ends it. The key
+                check's recording of leg3 runs from just after the merge to the end of the
+                watch; it is summarised as per-second levels (RMS dBFS) and deleted.
+  --conf --in2  D4-in2: as D4, but leg2 is a call IN. Hold leg1, wait 60 s for a call in from
+                the forward number (as E2), answer it as leg2, then as D4 from the hello-world
+                to leg2: hold it, the factory INVITE and the REFERs for leg2, then leg1.
 In a 3-way, * on either phone plays a beep and # ends the test.
 If the carrier holds a leg from its side (a ChannelHold event: its answer to an unhold, or its
 own re-INVITE, carried a=sendonly or a=inactive) and the leg is still held when the test
@@ -41,10 +49,12 @@ D4 key check (--conf, on unless --no-key-check): during the talk a snoop channel
 audio the conference sends to leg3, inside the container. When the talk ends the script
 downloads it into memory, deletes it in Asterisk and searches it for DTMF tones. The testers
 press 1 (test phone) and 2 (forward number) three times each, so a tone shows whose key got
-through. Keypad events on leg3 (RFC 4733) are logged as before.
+through. Keypad events on leg3 (RFC 4733) are logged as before. With --watch-end the same
+recording runs on until the watch ends (with --no-key-check too, then only for the levels).
 
   export HOME_PHONE_ARI_PASSWORD="$(grep '^HOME_PHONE_ARI_PASSWORD=' ../.env | cut -d= -f2-)"
   python3 tests/testd.py [--moh] [--mix | --mix-direct | --wait-in | --conf [--flash]]
+  python3 tests/testd.py --conf [--in2] [--watch-end [S]] [--conf-uri URI]
   python3 tests/testd.py --probe [--wide] [--all] [--icsi] [--conf-uri URI ...]
   (HOME_PHONE_TEST_PLMN=MCC-MNC in the shell, or --plmn, fills the mobile-form address)
 
@@ -166,7 +176,8 @@ END_HOW = {
 # feeds with the frames leg3 receives. Its recording is ARI's format=wav: 8 kHz 16-bit mono.
 KEY_WAIT = 5                  # s for the snoop channel, RecordingStarted and RecordingFinished
 KEY_MAX_SECS = TALK_LIMIT + 30  # maxDurationSeconds: the recording ends by itself after this
-KEY_MAX_BYTES = 16 << 20      # the largest download accepted (330 s of 8 kHz audio is 5.3 MB)
+KEY_MAX_BYTES = 16 << 20      # the largest download accepted (330 s of 8 kHz audio is 5.3 MB,
+#                               WATCH_REC_SECS is 16.0 MB)
 KEY_FOLDER = "/var/spool/asterisk/recording"
 KEY_RM = ("docker exec home-phone sh -c 'rm -f " + KEY_FOLDER + "/testd-keys-*'")
 # The DTMF detector, modelled on Asterisk's main/dsp.c dtmf_detect(). Each value is in the
@@ -193,6 +204,23 @@ DTMF_GAP = 7            # 7 blocks without the digit end a press: a gap of 40 ms
 #                         does and one under 20 ms never does (ES 201 235-3, cited in dsp.c)
 DTMF_DBM0 = 20 * math.log10(22300.0 * DTMF_N / 2)   # |X|^2 in dB of a 0 dBm0 tone, whose peak
 #                         is 22300 in 16-bit G.711 audio: dBm0 = 10 log10(|X|^2) - DTMF_DBM0
+# D4 --watch-end, the end-of-merge check. These are fixed for this test script; the service
+# keeps its own limits as settings.
+WATCH_DEFAULT = 180           # s leg3 stays up after Enter when --watch-end has no number
+WATCH_RANGE = (10, 900)       # s --watch-end accepts
+WATCH_HANGUP_WAIT = ASK_WAIT  # s the script waits for Enter once it has asked both to hang up
+WATCH_NOTE = 30               # s between "leg3 is still up" lines during the watch
+WATCH_REC_SECS = 1000         # maxDurationSeconds cap: 8 kHz 16-bit audio is 16 000 bytes a
+#                               second, so the 16 MB tmpfs holds about 1048 s
+WATCH_SILENT_DBFS = -55.0     # a second below this is silent: a quiet line or comfort noise
+#                               sits near -60 to -70 dBFS, and mu-law's smallest step is -72
+WATCH_LOUD_DBFS = -40.0       # a second at or above this is at tone or speech level: a network
+#                               tone of -10 dBm0 is about -16 dBFS, and a second in which
+#                               someone talks is about -20 to -35 dBFS
+WATCH_GAP = 2.0               # s: a file this much shorter than the time it ran means stretches
+#                               with no audio frames (no RTP from Airtel)
+WATCH_RUNS = 8                # runs of silent / low / loud seconds shown in the RESULT
+LEVEL_FLOOR = -99.0           # dBFS given to digital silence
 _sumprod = getattr(math, "sumprod", None)      # Python 3.12 and later
 if _sumprod is None:
     def _sumprod(a, b, _mul=operator.mul):
@@ -316,6 +344,35 @@ def find_key_tones(samples):
             run, misses = [hit, i, i, 1, [pr], [pc]], 0
     close(run)
     return presses
+
+
+def second_levels(samples):
+    """The RMS level of each second of 8 kHz 16-bit audio, in dBFS (full scale 32768, so a
+    full-scale sine is -3 dBFS). A last part second counts if it holds half a second or more.
+    Digital silence is LEVEL_FLOOR."""
+    out = []
+    for start in range(0, len(samples), DTMF_RATE):
+        blk = samples[start:start + DTMF_RATE]
+        if len(blk) < DTMF_RATE // 2:
+            break
+        energy = _sumprod(blk, blk)
+        level = 10 * math.log10(energy / len(blk) / 32768.0 ** 2) if energy else LEVEL_FLOOR
+        out.append(max(LEVEL_FLOOR, level))
+    return out
+
+
+def level_runs(levels):
+    """[(class, first second, last second), ...] for a list of per-second levels: 'silent'
+    below WATCH_SILENT_DBFS, 'loud' at or above WATCH_LOUD_DBFS, 'low' between."""
+    runs = []
+    for i, level in enumerate(levels):
+        kind = ("silent" if level < WATCH_SILENT_DBFS else "loud" if level >= WATCH_LOUD_DBFS
+                else "low")
+        if runs and runs[-1][0] == kind:
+            runs[-1][2] = i
+        else:
+            runs.append([kind, i, i])
+    return [tuple(r) for r in runs]
 
 
 def tone_summary(presses):
@@ -611,6 +668,7 @@ class TestD:
     def __init__(self, opt, rest, log):
         self.opt, self.rest, self.log = opt, rest, log
         self.mode = ("D4a" if opt.probe else "D4-flash" if opt.conf and opt.flash
+                     else "D4-in2" if opt.conf and opt.in2
                      else "D4" if opt.conf else "D3" if opt.mix
                      else "D3b" if opt.mix_direct else "E2" if opt.wait_in
                      else "D2" if opt.moh else "D1")
@@ -646,6 +704,8 @@ class TestD:
         self.kc = None         # the D4 key check while it runs (see key_check_start)
         self.talk_started = False
         self.hung_up = set()   # labels cleanup() has already hung up
+        self.merge_at = None   # time.monotonic() when both REFERs had worked
+        self.watch = None      # --watch-end while it runs and after (see end_watch)
 
     # ---- results -------------------------------------------------------------------------
 
@@ -788,6 +848,10 @@ class TestD:
         kc = self.kc
         if isinstance(rec, dict) and kc and rec.get("name") == kc["name"]:
             kc["state"] = str(rec.get("state", ""))
+            if kind == "RecordingStarted":
+                kc["t0"] = time.monotonic()     # --watch-end places Enter in the file by this
+            elif kind in ("RecordingFinished", "RecordingFailed"):
+                kc["t_end"] = time.monotonic()
             if kind == "RecordingFailed":
                 kc["fail_cause"] = str(rec.get("cause") or "no cause given")
         # Asterisk raises ChannelHold only for a hold from the far end (ast_queue_hold); the
@@ -1032,6 +1096,8 @@ class TestD:
             self.moh_on = ok
         if self.opt.wait_in:
             self.call_in()
+        elif self.opt.conf and self.opt.in2:
+            self.call_in_conf(forward)
         else:
             self.dial_out(forward)
 
@@ -1139,6 +1205,62 @@ class TestD:
                   f"/channels/{self.legs['leg1']}/hold")
         self.pause("E2 unhold leg1")
         self.join("E2")
+
+    def call_in_conf(self, forward):
+        """D4 --in2: leg1 is held. Wait for a call in from the forward number (the dialplan
+        sends a test number or the forward number here while TESTD_WAIT=1, as for E2), answer
+        it as leg2 and go on as D4. A call in from any other number is refused with busy and
+        the wait goes on."""
+        self.step = "D4-in2 wait for a call in"
+        if not self.set_flag("1", "D4-in2: set TESTD_WAIT=1 so the next call in comes here"):
+            self.fail("D4-in2: ARI would not set TESTD_WAIT")
+            self.return_caller(failed=True)
+            return
+        want = re.sub(r"\D", "", forward)[-10:]
+        self.log(f"D4-in2: call the landline now from the forward number. Waiting {WAIT_IN} s.")
+        end, ev, refused = time.monotonic() + WAIT_IN, None, 0
+        while ev is None:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            ev = self.wait_for(left, lambda e: e.get("type") == "StasisStart"
+                               and first_arg(e) == "incoming" and not self.label_of(
+                                   channel_of(e).get("id")))
+            if ev is None:
+                break
+            number = re.sub(r"\D", "", str((channel_of(ev).get("caller") or {}).get("number")
+                                           or ""))
+            if number.endswith(want):
+                break
+            refused += 1
+            self.log(f"D4-in2: the call in from a number ending in {number[-4:] or '(none)'} is "
+                     "not the forward number: refusing it (busy) and waiting on")
+            self.ari("D4-in2: refuse that call (busy)", "DELETE",
+                     f"/channels/{channel_of(ev).get('id')}", reason="busy")
+            ev = None
+        self.set_flag("0", "D4-in2: clear TESTD_WAIT")
+        if ev is None:
+            self.fail(f"D4-in2: no call in from the forward number reached the script in "
+                      f"{WAIT_IN} s"
+                      + (f" ({refused} call(s) in from another number were refused)" if refused
+                         else "")
+                      + ". Check the trace for a second INVITE and Asterisk's answer to it.")
+            self.return_caller(failed=True)
+            return
+        self.legs["leg2"] = channel_of(ev)["id"]
+        self.log("D4-in2: the forward number called in while leg1 was held")
+        self.subscribe("leg2")
+        self.step = "D4-in2 answer leg2"
+        ok, _ = self.ari("D4-in2: answer leg2", "POST", f"/channels/{self.legs['leg2']}/answer")
+        if not ok:
+            self.fail("D4-in2: could not answer the call in")
+            self.hangup("D4-in2 hang up leg2", "leg2")
+            self.return_caller(failed=True)
+            return
+        self.answered_at = time.monotonic()
+        self.required = {"leg1", "leg2"}
+        self.pause("D4-in2 answer")
+        self.conference(forward)
 
     def join(self, tag):
         self.step = f"{tag} join"
@@ -1327,8 +1449,20 @@ class TestD:
 
     @staticmethod
     def replaces(d):
-        """RFC 3891 section 3: the recipient compares to-tag with its local tag, so to-tag is
-        Airtel's tag on our dialog and from-tag is ours, for incoming and outgoing legs."""
+        """The Replaces value for one of our dialogs: Call-ID;to-tag=theirs;from-tag=ours.
+
+        RFC 3891 section 3 defines the tags relative to the dialog as its recipient holds it,
+        not by the To and From headers of the first INVITE: the recipient matches them "as if
+        they were tags present in an incoming request", so to-tag is compared with its local
+        tag and from-tag with its remote tag. The recipient of the focus's INVITE with
+        Replaces is Airtel's side of our call, whose local tag is our remote tag. So to-tag is
+        always Airtel's tag and from-tag always ours, whoever placed the call:
+        - leg2 dialled out (D4): ours is the From tag of our INVITE, Airtel's the To tag of its
+          200 OK;
+        - leg1, or leg2 with --in2 (calls in): ours is the To tag of our 200 OK, Airtel's the
+          From tag of its INVITE.
+        PJSIP's local_tag and remote_tag (CHANNEL(pjsip,...)) are the dialog's own tags in
+        both directions, so one formula is right for both."""
         return urllib.parse.quote(f"{d['call_id']};to-tag={d['remote_tag']};"
                                   f"from-tag={d['local_tag']}", safe="")
 
@@ -1753,6 +1887,7 @@ class TestD:
             if moves is None:
                 self.recover()
                 return
+            self.merge_at = time.monotonic()
             self.talk(focus, moves)
         except CallEnded as e:
             if e.leg != "leg3":
@@ -1863,8 +1998,14 @@ class TestD:
                     "done, or type n if either could not hear the other.")
             kc = self.kc
             if kc and kc["requested"] and not kc["error"]:
-                keys += (" The conference audio is recorded for the key check until the talk "
-                         "ends, and the script then deletes it.")
+                if self.opt.watch_end is not None:
+                    keys += (" The conference audio is recorded for the "
+                             + ("end watch" if self.opt.no_key_check
+                                else "key check and the end watch")
+                             + " until the end watch is over, and the script then deletes it.")
+                else:
+                    keys += (" The conference audio is recorded for the key check until the "
+                             "talk ends, and the script then deletes it.")
             if flash:
                 self.log("D4 flash: leg3 is up. If Airtel joined the three calls, both phones "
                          "heard hello-world and can hear each other. Talk on both phones. " + keys)
@@ -1878,13 +2019,15 @@ class TestD:
             raise
         talk = int(time.monotonic() - start)
         self.required.discard("leg3")           # from here its end is reported, not a failure
-        self.key_check_end()
+        watch = self.opt.watch_end is not None
+        if not watch:                           # --watch-end: the recording runs on
+            self.key_check_end()
         if said is not None and said.startswith("n"):
             heard = "n"
         else:
             self.step = "D4 question"
             heard = self.ask_yn("Did both phones hear each other and hello-world? y/n")
-        drop = "not tested (--no-drop)"
+        drop = "not tested (--watch-end)" if watch else "not tested (--no-drop)"
         if not self.opt.no_drop:
             self.step = "D4 drop"
             if "leg3" in self.ended:
@@ -1923,7 +2066,9 @@ class TestD:
                     if focus["isfocus"] == "unreadable" else "")
             self.passed(f"both calls moved into Airtel's conference and the testers heard each "
                         f"other. {sig}{note}")
-        if self.opt.no_drop:
+        if watch:
+            self.end_watch()
+        elif self.opt.no_drop:
             self.stay()
 
     def stay(self):
@@ -2018,6 +2163,196 @@ class TestD:
             + f"; beep heard: {beep_heard or 'no answer'}.")
         return False
 
+    # ---- Test D4: the end of a merged call (--watch-end) ------------------------------------
+
+    def end_watch(self):
+        """--watch-end, after the heard question: both testers hang up and press Enter, and
+        leg3 stays up for S s while the script watches for Airtel ending it. Then the key
+        check's recording, running since just after the merge, is stopped, fetched, summarised
+        as per-second levels (and searched for key tones) and deleted, and leg3 is hung up.
+        The verdict is already set: this adds the End watch sentence only (watch_text), and a
+        Ctrl-C here ends the watch early."""
+        secs = self.opt.watch_end
+        if self.merge_at is None:               # not reached without a merge; kept safe
+            self.merge_at = time.monotonic()
+        w = self.watch = {"secs": secs, "prompt_at": time.monotonic(), "enter_at": None,
+                          "enter_how": "", "end_at": None, "stopped": False, "bye_at": None,
+                          "before": False, "audio": None, "late_at": None, "cut": False}
+        gone = lambda: "leg3" in self.ended         # noqa: E731
+        self.step = "D4 end watch"
+        try:
+            if gone():
+                w["before"] = True
+                self.log("D4 end watch: leg3 had already ended, so there is nothing to watch")
+            else:
+                answer = self.ask(
+                    "D4 end watch. Talk a few seconds more, then both of you hang up. Press Enter "
+                    f"here when both phones have hung up. The script then keeps leg3 on the call "
+                    f"for {secs} s and logs whether Airtel ends it.", limit=WATCH_HANGUP_WAIT)
+                w["enter_at"] = time.monotonic()
+                w["enter_how"] = ("Enter" if answer is not None
+                                  else "the terminal input had ended" if self.stdin_eof
+                                  else f"no Enter came in {WATCH_HANGUP_WAIT} s")
+                if answer is None:
+                    self.log(f"D4 end watch: {w['enter_how']}, so the watch counts from now")
+                if not gone():
+                    self.log(f"D4 end watch: watching leg3 for {secs} s")
+                    end = w["enter_at"] + secs
+                    while not gone():
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            break
+                        self.wait_for(min(WATCH_NOTE, left), lambda e: gone())
+                        if not gone() and end - time.monotonic() > 0.5:
+                            self.log(f"D4 end watch: {time.monotonic() - w['enter_at']:.0f} s "
+                                     "after Enter, leg3 is still up")
+        except KeyboardInterrupt:
+            w["stopped"] = True
+            self.log("D4 end watch: stopped with Ctrl-C")
+        w["end_at"] = time.monotonic()
+        if gone():
+            w["bye_at"] = self.ended_at["leg3"]
+            where = (f"{w['bye_at'] - w['enter_at']:.1f} s after Enter, " if w["enter_at"]
+                     and w["bye_at"] >= w["enter_at"] else
+                     f"{w['enter_at'] - w['bye_at']:.1f} s before Enter, " if w["enter_at"]
+                     else "")
+            self.log(f"D4 end watch: leg3 ended {where}"
+                     f"{w['bye_at'] - self.merge_at:.1f} s after the merge: "
+                     f"{self.end_str('leg3')}")
+        elif not w["stopped"]:
+            self.log(f"D4 end watch: Airtel did not end leg3 within {secs} s of Enter")
+        try:
+            self.key_check_end()                # watch_levels() runs inside it
+            if not gone():
+                # Events that came while the recording was read are still queued: read them,
+                # so a leg3 that ended in that time is not taken for one the script hangs up.
+                self.wait_for(0.2, lambda e: gone())
+            hung = False if gone() else self.hangup("D4 end watch: hang up leg3", "leg3")
+        except KeyboardInterrupt:
+            # A second Ctrl-C while the recording is read: the verdict stands, and cleanup()
+            # deletes the recording and hangs up leg3.
+            w["cut"] = True
+            self.log("D4 end watch: stopped with Ctrl-C while the recording was read; the "
+                     "cleanup deletes it and hangs up leg3")
+            return
+        if w["bye_at"] is None and gone() and not hung:
+            # leg3 ended after the watch, while the recording was read (or its DELETE found it
+            # gone): the script did not hang it up.
+            w["late_at"] = self.ended_at["leg3"]
+            self.log(f"D4 end watch: leg3 ended {w['late_at'] - w['end_at']:.1f} s after the "
+                     f"watch ended, while the script read the recording: {self.end_str('leg3')}")
+
+    def watch_levels(self, samples):
+        """--watch-end: log the per-second level timeline of the whole recording and keep a
+        summary of the part after Enter (or after the end-watch prompt, without an Enter) for
+        the RESULT. Nothing but numbers leaves this function."""
+        w, kc = self.watch, self.kc
+        levels = second_levels(samples)
+        file_secs = len(samples) / DTMF_RATE
+        t0 = kc.get("t0") or w["prompt_at"]
+        ref = w["enter_at"] or w["prompt_at"]
+        ref_name = "Enter" if w["enter_at"] else "the end-watch prompt"
+        k = min(len(levels), max(0, int(ref - t0 + 0.5)))
+        self.log(f"D4 end watch: levels in dBFS, one a second from the start of the recording "
+                 f"({len(levels)} s; {ref_name} at {k} s, the merge "
+                 f"{max(0.0, t0 - self.merge_at):.0f} s before the start):")
+        for i in range(0, len(levels), 20):
+            self.log(f"  {i:>4} s: " + " ".join(f"{v:.0f}" for v in levels[i:i + 20]))
+        notes = []
+        t_end = kc.get("t_end") or self.ended_at.get("snoop") or time.monotonic()
+        gap = (t_end - t0) - file_secs
+        head = f"Audio after {ref_name}"
+        if gap > WATCH_GAP:
+            # Enter is placed in the file by the clock, but a stretch without RTP writes
+            # nothing, and the file does not show where it fell. Any of it before Enter moves
+            # Enter earlier in the file than k, so the summary below may miss that much.
+            head = (f"Audio from {k} s into the file, where {ref_name} falls only if no audio "
+                    f"was missing before it ({ref_name} may be up to {min(gap, k):.0f} s "
+                    "earlier in the file, so that much audio after it may be left out)")
+            notes.append(f"the file holds {gap:.0f} s less audio than the {t_end - t0:.0f} s it "
+                         "ran: for that long no audio frames came from Airtel (no RTP), and the "
+                         "file does not show when, so the seconds after such a stretch count "
+                         "early")
+        if w["end_at"] and t_end < w["end_at"] - WATCH_GAP and not gap > WATCH_GAP:
+            notes.append(f"the recording stopped {w['end_at'] - t_end:.0f} s before the watch "
+                         "ended")
+        after = levels[k:]
+        if not after:
+            text = (f"none: the file ends before {k} s" if gap > WATCH_GAP
+                    else f"none: the recording ended before {ref_name}")
+        else:
+            runs = level_runs(after)
+            count = {kind: sum(b - a + 1 for kk, a, b in runs if kk == kind)
+                     for kind in ("silent", "low", "loud")}
+            longest = max([b - a + 1 for kk, a, b in runs if kk == "silent"], default=0)
+            shape = ", ".join(f"{kind} {a}-{b} s" if b > a else f"{kind} {a} s"
+                              for kind, a, b in runs[:WATCH_RUNS])
+            if len(runs) > WATCH_RUNS:
+                shape += f", {len(runs) - WATCH_RUNS} more runs"
+            text = (f"{len(after)} s recorded: silent {count['silent']} s (below "
+                    f"{WATCH_SILENT_DBFS:g} dBFS), low {count['low']} s, tone or speech level "
+                    f"{count['loud']} s (at or above {WATCH_LOUD_DBFS:g} dBFS; loudest "
+                    f"{max(after):.0f} dBFS), longest silent run {longest} s; in order: {shape}")
+        if notes:
+            text += "; " + "; ".join(notes)
+        w["audio"] = f"{head}: {text}."
+        self.log(f"D4 end watch: {w['audio']}")
+
+    def watch_text(self):
+        """The End watch sentence for the RESULT line ('' when it was never due)."""
+        w = self.watch
+        if w is None:
+            return ("End watch: not reached, the run stopped first." if self.talk_started
+                    else "")
+        secs, merge = w["secs"], self.merge_at or w["prompt_at"]
+        cause = ""
+        if "leg3" in self.ended:
+            # The script had not hung leg3 up, so the end came from the far side, most likely
+            # Airtel's BYE. Without a hang-up cause ARI does not show even that much.
+            code, code_text = self.ended["leg3"]
+            cause = (cause_str(code, code_text) if code is not None
+                     else END_HOW.get(self.end_how.get("leg3"), "ARI gave no cause")
+                     + "; no BYE is confirmed, so check the trace")
+        if w["bye_at"] is not None:
+            after_merge = f"{w['bye_at'] - merge:.0f} s after the merge"
+            if w["before"]:
+                text = f"leg3 ended before the end watch began, {after_merge} ({cause})"
+            elif w["enter_at"] is None:
+                text = f"leg3 ended {after_merge}, before Enter ({cause})"
+            elif w["bye_at"] >= w["enter_at"]:
+                text = (f"leg3 ended {w['bye_at'] - w['enter_at']:.1f} s after Enter, "
+                        f"{after_merge} ({cause})")
+            else:
+                text = (f"leg3 ended {w['enter_at'] - w['bye_at']:.1f} s before Enter, "
+                        f"{after_merge} ({cause})")
+        else:
+            if w["stopped"]:
+                when = (f"{w['end_at'] - w['enter_at']:.0f} s after Enter" if w["enter_at"]
+                        else "before Enter")
+                text = f"stopped with Ctrl-C {when}; leg3 had not ended by then"
+            else:
+                text = f"Airtel did not end leg3 within {secs} s of Enter"
+            if w["late_at"] is not None:
+                text += (f", but leg3 ended {w['late_at'] - w['end_at']:.1f} s after the watch "
+                         f"ended, while the script read the recording ({cause}); the script did "
+                         "not hang it up")
+            elif w["cut"]:
+                text += ("; a second Ctrl-C stopped the reading of the recording, and the "
+                         "cleanup hung leg3 up")
+            else:
+                text += ", so the script hung it up"
+        if w["enter_at"] and w["enter_how"] != "Enter":
+            text += f". The watch counted from when {w['enter_how']}"
+        kc = self.kc
+        if w["audio"]:
+            audio = w["audio"]
+        elif kc is not None and kc["error"]:
+            audio = (f"No audio summary: {kc['error']}." if self.opt.no_key_check
+                     else "No audio summary: the recording failed (see Key check).")
+        else:
+            audio = "No audio summary: the recording was not analysed."
+        return f"End watch ({secs} s): {text}. {audio}"
+
     # ---- Test D4: the key check -----------------------------------------------------------
 
     def key_check_start(self):
@@ -2026,9 +2361,22 @@ class TestD:
         holds it until the recording ends (res_stasis_recording record_file), so recording
         leg3 itself would hold back the beep for *; the snoop channel takes that wait. A failed
         step is logged and leaves kc['error']; the test goes on without the check."""
-        if self.opt.no_key_check:
+        watch = self.opt.watch_end
+        if self.opt.no_key_check and watch is None:
             self.log("D4 key check: off (--no-key-check)")
             return
+        if self.opt.no_key_check:
+            self.log("D4 key check: off (--no-key-check); the end watch still records leg3, "
+                     "for its levels only")
+        max_secs = KEY_MAX_SECS
+        if watch is not None:
+            # The talk, two questions, the wait for Enter, the watch and a margin.
+            want = TALK_LIMIT + 2 * ASK_WAIT + WATCH_HANGUP_WAIT + watch + 30
+            max_secs = min(WATCH_REC_SECS, want)
+            if want > WATCH_REC_SECS:
+                self.log(f"D4 end watch: the recording stops by itself after {WATCH_REC_SECS} s "
+                         "(the 16 MB tmpfs), so after a long talk the end of the watch is not "
+                         "recorded")
         # The dash keeps 10 digits from running together, which the log's redaction would mask.
         tag = uuid.uuid4().hex[:6] + "-" + uuid.uuid4().hex[:6]
         # requested: a record request went out, so a file may exist; started: ARI accepted it;
@@ -2065,7 +2413,7 @@ class TestD:
             kc["requested"] = True              # from here a file may exist: cleanup deletes it
             ok, _ = self.ari("D4 key check: record the snoop channel", "POST",
                              f"/channels/{self.legs['snoop']}/record", name=kc["name"],
-                             format="wav", maxDurationSeconds=KEY_MAX_SECS, ifExists="overwrite",
+                             format="wav", maxDurationSeconds=max_secs, ifExists="overwrite",
                              beep="false", terminateOn="none")
             if not ok:
                 kc["error"] = f"Asterisk refused the recording ({self.last_error})"
@@ -2077,6 +2425,7 @@ class TestD:
                 self.hangup("D4 key check: hang up the snoop channel", "snoop")
                 return
             kc["started"] = True
+            kc["t0"] = time.monotonic()         # RecordingStarted, when it comes, sets it again
             # Wait for RecordingStarted: a stop while the recording is still queued is ignored
             # in 20.6 (recording_disregard), and the recording would then run on.
             self.wait_for(KEY_WAIT, lambda e: kc["state"] not in ("", "queued")
@@ -2116,6 +2465,7 @@ class TestD:
             if not kc["requested"]:
                 return
             self.key_check_settle(lambda s: self.wait_for(s))
+            kc.setdefault("t_end", self.ended_at.get("snoop") or time.monotonic())
             data = None
             if kc["state"] == "failed":
                 kc["error"] = kc["error"] or f"Asterisk could not record ({kc['fail_cause']})"
@@ -2177,7 +2527,8 @@ class TestD:
                      f"Remove it by hand: {KEY_RM}")
 
     def key_check_analyse(self, data):
-        """Read the WAV in memory and look for DTMF tones in it."""
+        """Read the WAV in memory, summarise its levels for --watch-end, and look for DTMF
+        tones in it (not with --no-key-check)."""
         kc = self.kc
         try:
             samples, unclosed = read_wav(data)
@@ -2186,6 +2537,14 @@ class TestD:
             if unclosed:
                 self.log(f"D4 key check: the WAV header has no sizes (Asterisk had not closed the "
                          f"file), so the {secs:.0f} s after it are read as the audio")
+            if self.watch is not None:
+                try:
+                    self.watch_levels(samples)
+                except Exception as e:          # a bug here must not stop the test
+                    self.watch["audio"] = f"No audio summary: the level count failed ({e!r})."
+                    self.log(f"D4 end watch: {self.watch['audio']}")
+            if self.opt.no_key_check:
+                return
             loudest = max(map(abs, samples)) if samples else 0
             if secs < 2:
                 raise ValueError(f"the recording holds only {secs:.1f} s of audio")
@@ -2234,13 +2593,18 @@ class TestD:
         kc = self.kc
         events = (f"keypad events on leg3: {' '.join(self.keys)}" if self.keys
                   else "no keypad events on leg3")
-        if kc is None:
-            return ("Key check: off (--no-key-check); " + events + "."
-                    if self.opt.no_key_check and self.talk_started else "")
-        if kc["error"]:
+        if self.opt.no_key_check:
+            # With --watch-end a recording ran all the same, for the levels only.
+            text = ("Key check: off (--no-key-check); " + events + "."
+                    if self.talk_started else "")
+        elif kc is None:
+            return ""
+        elif kc["error"]:
             text = f"Key check did not run: {kc['error']}; {events}."
         elif kc["presses"] is None:
-            text = f"Key check: not analysed, the run stopped first; {events}."
+            why = ("a second Ctrl-C stopped the reading" if self.watch and self.watch["cut"]
+                   else "the run stopped first")
+            text = f"Key check: not analysed, {why}; {events}."
         elif kc["presses"]:
             text = (f"Key check: {events}; in-band tones in the conference audio: "
                     f"{tone_summary(kc['presses'])}.")
@@ -2249,9 +2613,9 @@ class TestD:
         else:
             text = (f"Key check: no keypad events and no key tones in {kc['secs']:.0f} s of "
                     "conference audio: key presses stop at Airtel's conference.")
-        if kc["requested"] and not kc["gone"]:
+        if kc is not None and kc["requested"] and not kc["gone"]:
             text += (f" The recording {kc['name']} may still be in the container: {KEY_RM}")
-        return text
+        return text.strip()
 
     # ---- start and finish ----------------------------------------------------------------
 
@@ -2307,6 +2671,10 @@ class TestD:
                 self.log(f"cleanup error: {e!r}")
             if self.verdict is None:
                 self.verdict, self.detail = "STOPPED", f"no result reached ({self.step})"
+            if self.opt.conf and self.opt.watch_end is not None:
+                text = self.watch_text()
+                if text:
+                    self.add_sentence(text)
             if self.verdict in ("PASS", "FAIL", "UNCLEAR"):
                 if self.opt.conf:
                     self.add_sentence("The script does not judge voices: the audio verdict is "
@@ -2385,9 +2753,21 @@ def main():
                     help="--conf --no-drop: before the stay, on Enter, hold leg3 for S s "
                          "(default 10), take it off hold, play a beep into the conference and "
                          "ask what the phones heard")
+    d4.add_argument("--watch-end", type=int, nargs="?", const=WATCH_DEFAULT, metavar="S",
+                    help="--conf: the end-of-merge check. No drop test: after the heard question "
+                         "both testers hang up and press Enter, and the script keeps leg3 up for "
+                         f"S s (default {WATCH_DEFAULT}, {WATCH_RANGE[0]} to {WATCH_RANGE[1]}) "
+                         "and logs whether Airtel ends it. The key check's recording runs from "
+                         "the merge to the end of the watch and is summarised as per-second "
+                         "levels. Not with --flash or --hold-leg3")
+    d4.add_argument("--in2", action="store_true",
+                    help="--conf: leg2 is a call in from the forward number while leg1 is held "
+                         f"(waits {WAIT_IN} s, as E2), not a call out. Reported as D4-in2. Not "
+                         "with --flash or --dial-out")
     d4.add_argument("--no-key-check", action="store_true",
                     help="--conf: do not record the conference audio during the talk, so no "
-                         "search for key tones (keypad events on leg3 are still logged)")
+                         "search for key tones (keypad events on leg3 are still logged). With "
+                         "--watch-end the recording still runs, for the levels only")
     opt = ap.parse_args()
     d4_mode = opt.probe or opt.conf
     if opt.moh and opt.probe:
@@ -2402,6 +2782,8 @@ def main():
             ("--dial-out", opt.dial_out, opt.conf, "--conf"),
             ("--flash", opt.flash, opt.conf, "--conf"),
             ("--no-drop", opt.no_drop, opt.conf, "--conf"),
+            ("--watch-end", opt.watch_end is not None, opt.conf, "--conf"),
+            ("--in2", opt.in2, opt.conf, "--conf"),
             ("--no-key-check", opt.no_key_check, opt.conf, "--conf")):
         if given and not allowed:
             ap.error(f"{flag} works only with {where}")
@@ -2410,6 +2792,21 @@ def main():
                  "calls the party, so there is no party dialog to send the REFER in")
     if opt.flash and (opt.dial_out or opt.refer_in):
         ap.error("--flash sends no REFER, so --dial-out and --refer-in do not go with it")
+    if opt.in2 and opt.flash:
+        ap.error("--in2 does not go with --flash: --flash tests a different way to join the "
+                 "calls, and its leg2 is always dialled out")
+    if opt.in2 and opt.dial_out:
+        ap.error("--in2 does not go with --dial-out: --dial-out hangs up leg2, so no incoming "
+                 "dialog would be merged")
+    if opt.watch_end is not None:
+        if opt.flash:
+            ap.error("--watch-end does not go with --flash: there leg3 is the flash call, not a "
+                     "leg in Airtel's conference")
+        if opt.hold_leg3 is not None:
+            ap.error("--watch-end does not go with --hold-leg3: run them as separate calls")
+        if not WATCH_RANGE[0] <= opt.watch_end <= WATCH_RANGE[1]:
+            ap.error(f"--watch-end takes {WATCH_RANGE[0]} to {WATCH_RANGE[1]} seconds")
+        opt.no_drop = True                  # the watch stays on the conference
     if opt.hold_leg3 is not None:
         if not opt.no_drop:
             ap.error("--hold-leg3 works only with --conf --no-drop")

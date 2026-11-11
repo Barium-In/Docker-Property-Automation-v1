@@ -25,8 +25,9 @@ services:
       - "HOME_PHONE_ARI_PASSWORD=${HOME_PHONE_ARI_PASSWORD:-}"
     volumes:
       - ./logs:/var/log/asterisk
-    # Test D4's key check records the conference audio here for up to 330 s. The tmpfs keeps
-    # it in memory, so no file of it is written to the host's disk, and a restart clears it.
+    # Test D4's key check records the conference audio here for up to 330 s (with --watch-end
+    # up to 1000 s, 16 MB). The tmpfs keeps it in memory, so no file of it is written to the
+    # host's disk, and a restart clears it.
     # Ubuntu's package ships no such folder: without this mount ARI cannot record (HTTP 500)
     # and the key check does not run.
     tmpfs:
