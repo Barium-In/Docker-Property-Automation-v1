@@ -136,3 +136,9 @@ format_pcm
 format_sln
 res_pjsip_registrar
 res_pjsip_authenticator_digest
+
+# Ganpath, stage 2 phase 1: Record() takes a voicemail in [ganpath-fallback] when the
+# Ganpath service is down. It needs only format_wav (listed above) for the .wav file;
+# silence detection is in the core. FILTER() and REPLACE() are in func_strings, EPOCH is
+# built in.
+app_record

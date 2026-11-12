@@ -3,8 +3,10 @@
 # phase 7). Run it on den-ubuntu from the Home-Phone folder:
 #   sh tests/check-ast22.sh
 # One line per check: PASS, FAIL, or SKIP for a Test D check while Test D is off
-# (HOME_PHONE_ARI_PASSWORD empty). It prints only its own labels, so no number, address or
-# password from a command's output reaches the terminal. Exit status 1 if any check failed.
+# (HOME_PHONE_ARI_PASSWORD empty) and for a Ganpath check unless the container runs with
+# HOME_PHONE_TEST_MODE=ganpath. It reads both from the container's environment without
+# printing them. It prints only its own labels, so no number, address or password from a
+# command's output reaches the terminal. Exit status 1 if any check failed.
 set -u
 
 C=home-phone
@@ -17,6 +19,11 @@ skip() { printf 'SKIP  %s\n' "$1"; }
 
 # cli COMMAND: run an Asterisk CLI command in the container.
 cli() { docker exec "$C" asterisk -rx "$1" 2>/dev/null; }
+
+# envset NAME: true when the container's NAME is not empty; envis NAME VALUE: true when it
+# equals VALUE. Neither prints the value.
+envset() { docker exec "$C" sh -c "test -n \"\${$1:-}\"" 2>/dev/null; }
+envis() { docker exec "$C" sh -c "test \"\${$1:-}\" = \"$2\"" 2>/dev/null; }
 
 # has LABEL COMMAND PATTERN: PASS when the command's output matches the extended regex.
 has() {
@@ -105,32 +112,103 @@ has "function PJSIP_RESPONSE_HEADER" "core show function PJSIP_RESPONSE_HEADER" 
 has "function PJSIP_HEADER" "core show function PJSIP_HEADER" \
     "Info about Function 'PJSIP_HEADER'"
 
-# Test D: the web server, the ARI user and hold passthrough. Only while Test D is on.
+# The web server: on while Test D or Ganpath has an ARI password.
+testd=no; envset HOME_PHONE_ARI_PASSWORD && testd=yes
+gari=no; envset HOME_PHONE_GANPATH_ARI_PASSWORD && gari=yes
+gmode=no; envis HOME_PHONE_TEST_MODE ganpath && gmode=yes
 http=$(cli "http show status")
-if printf '%s\n' "$http" | grep -q 'Server Disabled'; then
-    for t in "web server on 127.0.0.1:8088" "ARI user homephone, not read-only" \
-        "airtel endpoint moh_passthrough=true" "port 8088 listens on loopback only"; do
-        skip "$t (Test D is off)"
-    done
+if [ "$testd" = no ] && [ "$gari" = no ]; then
+    if printf '%s\n' "$http" | grep -q 'Server Disabled'; then
+        pass "web server off (no ARI password set)"
+    else
+        fail "web server off (no ARI password set)"
+    fi
+    skip "port 8088 listens on loopback only (ARI is off)"
 else
     if printf '%s\n' "$http" | grep -q 'Server Enabled and Bound to 127\.0\.0\.1:8088$'; then
         pass "web server on 127.0.0.1:8088"
     else
         fail "web server on 127.0.0.1:8088"
     fi
-    if cli "ari show users" | awk '$NF == "homephone" && $1 == "No" { found = 1 } END { exit !found }'; then
-        pass "ARI user homephone, not read-only"
-    else
-        fail "ARI user homephone, not read-only"
-    fi
-    has "airtel endpoint moh_passthrough=true" "pjsip show endpoint airtel" \
-        'moh_passthrough[[:space:]]*:[[:space:]]*true'
     # Host networking: the container's listener shows up on the host.
     listen=$(ss -ltnH 'sport = :8088' 2>/dev/null | awk '{ print $4 }')
     if [ -n "$listen" ] && ! printf '%s\n' "$listen" | grep -qvx '127\.0\.0\.1:8088'; then
         pass "port 8088 listens on loopback only"
     else
         fail "port 8088 listens on loopback only"
+    fi
+fi
+users=$(cli "ari show users")
+
+# Test D: the ARI user and hold passthrough. Only while Test D is on.
+if [ "$testd" = no ]; then
+    for t in "ARI user homephone, not read-only" "airtel endpoint moh_passthrough=true"; do
+        skip "$t (Test D is off)"
+    done
+else
+    if printf '%s\n' "$users" | awk '$NF == "homephone" && $1 == "No" { found = 1 } END { exit !found }'; then
+        pass "ARI user homephone, not read-only"
+    else
+        fail "ARI user homephone, not read-only"
+    fi
+    has "airtel endpoint moh_passthrough=true" "pjsip show endpoint airtel" \
+        'moh_passthrough[[:space:]]*:[[:space:]]*true'
+fi
+
+# Ganpath (README, "Ganpath (stage 2, phase 1)"). Only with HOME_PHONE_TEST_MODE=ganpath.
+G_CHECKS="ARI user ganpath, not read-only
+dialplan [inbound] has extensions ganpath and T
+dialplan [ganpath-fallback] loaded
+dialplan [ganpath-hangup] loaded
+prompts folder mounted read-only at sounds/ganpath
+prompt ganpath-unavailable.wav readable by asterisk, a WAV file
+recording tmpfs is 64M
+voicemail folder, owned by asterisk
+voicemail sweep running"
+if [ "$gmode" = no ]; then
+    printf '%s\n' "$G_CHECKS" | while IFS= read -r t; do skip "$t (Ganpath mode is off)"; done
+else
+    if printf '%s\n' "$users" | awk '$NF == "ganpath" && $1 == "No" { found = 1 } END { exit !found }'; then
+        pass "ARI user ganpath, not read-only"
+    else
+        fail "ARI user ganpath, not read-only"
+    fi
+    if cli "dialplan show ganpath@inbound" | grep -q "Stasis(ganpath,inbound)" \
+        && cli "dialplan show T@inbound" | grep -q "Goto(ganpath-fallback,s,1)"; then
+        pass "dialplan [inbound] has extensions ganpath and T"
+    else
+        fail "dialplan [inbound] has extensions ganpath and T"
+    fi
+    has "dialplan [ganpath-fallback] loaded" "dialplan show ganpath-fallback" \
+        "Context 'ganpath-fallback' created by 'pbx_config'"
+    has "dialplan [ganpath-hangup] loaded" "dialplan show ganpath-hangup" \
+        "Context 'ganpath-hangup' created by 'pbx_config'"
+    mounts=$(docker inspect -f '{{range .Mounts}}{{.Destination}} {{.RW}}{{"\n"}}{{end}}' "$C" 2>/dev/null)
+    if printf '%s\n' "$mounts" | grep -qx '/usr/share/asterisk/sounds/ganpath false'; then
+        pass "prompts folder mounted read-only at sounds/ganpath"
+    else
+        fail "prompts folder mounted read-only at sounds/ganpath"
+    fi
+    if [ "$(docker exec -u asterisk "$C" head -c 4 /usr/share/asterisk/sounds/ganpath/ganpath-unavailable.wav 2>/dev/null)" = RIFF ]; then
+        pass "prompt ganpath-unavailable.wav readable by asterisk, a WAV file"
+    else
+        fail "prompt ganpath-unavailable.wav readable by asterisk, a WAV file"
+    fi
+    if [ "$(docker exec "$C" df -k /var/spool/asterisk/recording 2>/dev/null | awk 'NR == 2 { print $1, $2 }')" = "tmpfs 65536" ]; then
+        pass "recording tmpfs is 64M"
+    else
+        fail "recording tmpfs is 64M"
+    fi
+    if docker exec "$C" sh -c 'test -d /var/spool/asterisk/recording/voicemail && [ "$(stat -c %U /var/spool/asterisk/recording/voicemail)" = asterisk ]' 2>/dev/null; then
+        pass "voicemail folder, owned by asterisk"
+    else
+        fail "voicemail folder, owned by asterisk"
+    fi
+    # The bracket keeps this pattern from matching the grep's own command line.
+    if docker exec "$C" sh -c 'grep -qs "[h]ome-phone-vm-sweep" /proc/[0-9]*/cmdline' 2>/dev/null; then
+        pass "voicemail sweep running"
+    else
+        fail "voicemail sweep running"
     fi
 fi
 

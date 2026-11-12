@@ -23,15 +23,34 @@ services:
       - "HOME_PHONE_TEST_MODE=${HOME_PHONE_TEST_MODE:-menu}"
       # Test D only. Empty or unset: no ARI, exactly as stage 1. See README.
       - "HOME_PHONE_ARI_PASSWORD=${HOME_PHONE_ARI_PASSWORD:-}"
+      # Ganpath (README, "Ganpath (stage 2, phase 1)"). All empty or unset: nothing changes.
+      # The ARI user ganpath exists only while its password is set. The rest is used only
+      # with HOME_PHONE_TEST_MODE=ganpath. Empty numbers take the entrypoint's defaults,
+      # which match the Ganpath service's settings (`ganpath phone dialplan-vars`).
+      - "HOME_PHONE_GANPATH_ARI_PASSWORD=${HOME_PHONE_GANPATH_ARI_PASSWORD:-}"
+      - "HOME_PHONE_HA_FALLBACK_WEBHOOK=${HOME_PHONE_HA_FALLBACK_WEBHOOK:-}"
+      - "HOME_PHONE_GANPATH_DEADMAN_S=${HOME_PHONE_GANPATH_DEADMAN_S:-}"
+      - "HOME_PHONE_VM_MAX_S=${HOME_PHONE_VM_MAX_S:-}"
+      - "HOME_PHONE_VM_SILENCE_S=${HOME_PHONE_VM_SILENCE_S:-}"
+      - "HOME_PHONE_VM_RETENTION_H=${HOME_PHONE_VM_RETENTION_H:-}"
+      - "HOME_PHONE_VM_SWEEP_S=${HOME_PHONE_VM_SWEEP_S:-}"
     volumes:
       - ./logs:/var/log/asterisk
+      # Ganpath's recorded prompts, read-only; the fallback plays ganpath/ganpath-unavailable
+      # and the service plays sound:ganpath/<name>. HOME_PHONE_GANPATH_PROMPTS_DIR in the root
+      # .env moves the host folder; it must be the folder the Ganpath service writes to.
+      # Short syntax on purpose: when the host folder is missing, Docker creates it (empty,
+      # owned by root) and the container starts. This happens in every mode, menu included.
+      - ${HOME_PHONE_GANPATH_PROMPTS_DIR:-/srv/ganpath/prompts}:/usr/share/asterisk/sounds/ganpath:ro
     # Test D4's key check records the conference audio here for up to 330 s (with --watch-end
-    # up to 1000 s, 16 MB). The tmpfs keeps it in memory, so no file of it is written to the
-    # host's disk, and a restart clears it.
+    # up to 1000 s, 16 MB). Ganpath mode's fallback records voicemails in its voicemail/
+    # folder, up to HOME_PHONE_VM_MAX_S each (120 s at 8 kHz 16-bit is about 1.9 MB). The
+    # tmpfs keeps them in memory, so no file of them is written to the host's disk, and a
+    # restart clears them.
     # Ubuntu's package ships no such folder: without this mount ARI cannot record (HTTP 500)
     # and the key check does not run.
     tmpfs:
-      - /var/spool/asterisk/recording:size=16m,mode=0700
+      - /var/spool/asterisk/recording:size=64m,mode=0700
     # Keep at most 30 MB of console log. It holds SIP traces and caller numbers.
     logging:
       driver: json-file

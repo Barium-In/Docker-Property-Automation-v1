@@ -14,6 +14,8 @@ RUN apt-get update \
 
 COPY config/ /opt/home-phone/config/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# The Ganpath voicemail sweep. The entrypoint starts it only in Ganpath mode.
+COPY ganpath-vm-sweep.sh /usr/local/bin/home-phone-vm-sweep
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/home-phone-vm-sweep
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

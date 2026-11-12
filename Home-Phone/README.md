@@ -11,12 +11,14 @@ The fibre landline that comes with the broadband connection, run from this host 
 
 [Asterisk 22.12](#asterisk-2212-stage-2-phase-7) is an opt-in image for the rest of stage 2; the default build stays on Ubuntu's Asterisk 20.6.
 
+[Ganpath mode](#ganpath-stage-2-phase-1) sends test callers to the Ganpath assistant service in place of the test menu. It stays off unless you switch it on.
+
 ## Why it is built this way
 
 - **Host networking.** Call audio (RTP, UDP 10000–10100) has to reach the VM's LAN IP directly. Docker's bridge NAT breaks it.
 - **One registration.** The carrier expects one device on the line. Switch the account off in any softphone (Zoiper: **Unregister**) before starting this, or the two will steal calls from each other.
 - **Secrets in the root `.env`.** The number, password and test numbers are rendered into the Asterisk config when the container starts. Nothing personal is in git; this repo is public.
-- **Small surface.** PJSIP on UDP 5060 is the only port open to the network. There is no AMI. ARI listens on loopback (127.0.0.1:8088) only while `HOME_PHONE_ARI_PASSWORD` is set for Test D; without it there is no ARI and no web server. Calls are accepted only from the carrier's proxy address; there is no anonymous endpoint, so SIP from anywhere else is refused.
+- **Small surface.** PJSIP on UDP 5060 is the only port open to the network. There is no AMI. ARI listens on loopback (127.0.0.1:8088) only while `HOME_PHONE_ARI_PASSWORD` (Test D) or `HOME_PHONE_GANPATH_ARI_PASSWORD` (Ganpath) is set; without either there is no ARI and no web server. Calls are accepted only from the carrier's proxy address; there is no anonymous endpoint, so SIP from anywhere else is refused.
 - **Logs.** Docker keeps at most 30 MB of console log (3 files of 10 MB). NOTICE lines show only the last 4 digits of a number. The verbose lines and SIP traces still carry full numbers, and so does `logs/messages.log`, which nothing rotates: empty it after a test (see [Clear the logs](#clear-the-logs)).
 
 ## Setup
@@ -77,7 +79,7 @@ What it adds, only while `HOME_PHONE_ARI_PASSWORD` is set:
 - `moh_passthrough=yes` on the `airtel` endpoint. A hold then goes to Airtel as a re-INVITE with `a=sendonly`, in place of local music.
 - `tests/testd.py`, which runs on den-ubuntu with Python 3 and nothing else installed. It gets the forward number from the dialplan and the password from your shell, so neither is in the file.
 
-With the password empty or unset, the container starts as in stage 1: no web server, no ARI, no passthrough, and option 4 gives an error beep.
+With the password empty or unset, the container starts as in stage 1: no web server, no ARI, no passthrough, and option 4 gives an error beep. (If `HOME_PHONE_GANPATH_ARI_PASSWORD` is set, the web server and the ARI user `ganpath` stay on; see [Ganpath](#ganpath-stage-2-phase-1).)
 
 ### Switch it on
 
@@ -225,7 +227,7 @@ Docker's own copy rotates away after 30 MB. To drop it now, recreate the contain
 
 1. Empty `HOME_PHONE_ARI_PASSWORD` in the root `.env`, or delete the line.
 2. `unset HOME_PHONE_ARI_PASSWORD; docker compose --env-file ../.env up -d` (without the `unset`, a password still exported in this shell keeps Test D on)
-3. Check: `docker logs home-phone 2>&1 | grep "Test D"` says `Test D off`, `http show status` says `Server Disabled`, and `moh_passthrough` reads `false`.
+3. Check: `docker logs home-phone 2>&1 | grep "Test D"` says `Test D off`, `http show status` says `Server Disabled` (or `Server Enabled` while `HOME_PHONE_GANPATH_ARI_PASSWORD` is set), and `moh_passthrough` reads `false`.
 
 The container then runs as in stage 1, and option 4 gives an error beep. Options 1, 2 and 3, deflect mode and the outgoing test are unchanged throughout. The Test D files can stay in place, since none of them runs without the password; to remove them from the repo, revert the Test D commit.
 
@@ -252,7 +254,7 @@ D4 also runs a **key check** during the talk. In the Ganpath design a family mem
 - as keypad events (RFC 4733), which the script logs as `event ChannelDtmfReceived leg3`;
 - or as DTMF tones inside the mixed audio. Asterisk does not detect those, because `telephone-event` was negotiated on leg3, so they would pass as plain sound.
 
-For the second, the script puts an ARI snoop channel on leg3 that hears what the conference sends (`spy=in`) and records it as an 8 kHz WAV, `/var/spool/asterisk/recording/testd-keys-<random>.wav` in the container. `docker-compose.yml` mounts that folder as a 16 MB tmpfs, so the recording is held in memory and no file of it is written to den-ubuntu's disk. When the talk ends the script stops the recording, downloads the file into its own memory, deletes it in Asterisk and searches it for tones with a detector modelled on Asterisk's own (`main/dsp.c`). The two phones press different digits, so a tone shows whose key got through. `--no-key-check` skips the recording. With `--watch-end` the same recording runs on until the end of the watch (see [End of a merged call](#end-of-a-merged-call)), and `--no-key-check` then skips only the tone search.
+For the second, the script puts an ARI snoop channel on leg3 that hears what the conference sends (`spy=in`) and records it as an 8 kHz WAV, `/var/spool/asterisk/recording/testd-keys-<random>.wav` in the container. `docker-compose.yml` mounts that folder as a 64 MB tmpfs, so the recording is held in memory and no file of it is written to den-ubuntu's disk. When the talk ends the script stops the recording, downloads the file into its own memory, deletes it in Asterisk and searches it for tones with a detector modelled on Asterisk's own (`main/dsp.c`). The two phones press different digits, so a tone shows whose key got through. `--no-key-check` skips the recording. With `--watch-end` the same recording runs on until the end of the watch (see [End of a merged call](#end-of-a-merged-call)), and `--no-key-check` then skips only the tone search.
 
 ### Set up D4
 
@@ -264,7 +266,7 @@ docker exec home-phone asterisk -rx "dialplan show testd-refer"                 
 docker exec home-phone asterisk -rx "core show function PJSIP_RESPONSE_HEADER"    # present
 docker exec home-phone asterisk -rx "pjsip show registrations"                    # Registered
 docker logs home-phone 2>&1 | grep "Test D"                                       # Test D on
-docker exec home-phone df -h /var/spool/asterisk/recording                        # key check: tmpfs, 16M
+docker exec home-phone df -h /var/spool/asterisk/recording                        # key check: tmpfs, 64M
 docker exec home-phone ls -ld /var/spool/asterisk/recording                       # key check: drwx------ asterisk asterisk
 docker exec home-phone asterisk -rx "module show like snoop"                      # key check: res_stasis_snoop.so Running
 ```
@@ -501,7 +503,7 @@ Steps:
 
 Each tester hears the same as in D4 until they hang up.
 
-The recording is the key check's: one file of what leg3 receives (`spy=in`), from just after the merge to the end of the watch. It sits in the same tmpfs and is deleted the same way. It stops by itself after the talk, the questions and the watch, at 1000 s at most, which the 16 MB tmpfs holds. The script logs one level a second for the whole file (`D4 end watch: levels in dBFS`), and the RESULT summarises the part after Enter. No audio is kept or written anywhere else. With `--no-key-check` the script still records, but does not search for key tones.
+The recording is the key check's: one file of what leg3 receives (`spy=in`), from just after the merge to the end of the watch. It sits in the same tmpfs and is deleted the same way. It stops by itself after the talk, the questions and the watch, at 1000 s at most, about 16 MB, which the 64 MB tmpfs holds. The script logs one level a second for the whole file (`D4 end watch: levels in dBFS`), and the RESULT summarises the part after Enter. No audio is kept or written anywhere else. With `--no-key-check` the script still records, but does not search for key tones.
 
 `Ctrl-C` during the watch ends it early. The script still reads and deletes the recording, hangs up leg3 and prints the RESULT. A second `Ctrl-C` while it reads the recording stops the reading; the cleanup then deletes the recording and hangs up leg3, and the verdict stands. `Ctrl-C` before the watch, during the talk or a question, stops the run as in D4 and deletes the recording unread.
 
@@ -587,7 +589,7 @@ The 22.12 image is opt-in. `Dockerfile` (Ubuntu's 20.6 package, image `home-phon
 | File | What it does |
 |---|---|
 | `Dockerfile.ast22` | Two stages. The build stage downloads the 22.12.0 release and the pjproject 2.17 tarball it bundles, checks both against pinned SHA-256 sums, and compiles. The runtime stage holds the installed files, the libraries they link, Ubuntu's prompts and music on hold, and the same config and entrypoint. |
-| `ast22/modules.txt` | The 94 modules built, with the reason for each group. The build stops if one is missing or an unlisted one appears. |
+| `ast22/modules.txt` | The 95 modules built, with the reason for each group. The build stops if one is missing or an unlisted one appears. |
 | `ast22/asterisk.conf` | The directories, with the paths the 20.6 image uses. It sits outside `config/`, so the 20.6 image never gets it. |
 | `docker-compose.ast22.yml` | Compose override: builds from `Dockerfile.ast22` and tags the image `home-phone-asterisk:22.12.0`. |
 | `tests/check-ast22.sh` | Checks the running container and prints PASS, FAIL or SKIP per line. It prints no command output, so no number or address. |
@@ -596,7 +598,7 @@ What differs on 22.12:
 
 | Item | 20.6 image | 22.12 image |
 |---|---|---|
-| Modules | all of Ubuntu's (346) | the 94 in `ast22/modules.txt`. Left out on purpose: `func_env`, `func_shell` and `app_system` (file and shell access), CDR and CEL, other channel drivers, SIP MESSAGE, MWI, presence, T.38. |
+| Modules | all of Ubuntu's (346) | the 95 in `ast22/modules.txt`. Left out on purpose: `func_env`, `func_shell` and `app_system` (file and shell access), CDR and CEL, other channel drivers, SIP MESSAGE, MWI, presence, T.38. |
 | pjproject | 2.13.1 | 2.17 |
 | Our SIP headers | `Allow` lists MESSAGE; `Allow-Events` lists presence, dialog and message-summary | no MESSAGE, and `Allow-Events` without those three |
 | `ari show users` | `No    homephone` | `No    No    homephone` (a new ACL column) |
@@ -626,7 +628,7 @@ Pick a quiet time: no call and no Test D session. The 20.6 container keeps the l
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env build 2>&1 | tee ~/ast22-build.log
    ```
-   Watch memory from a second SSH session with `free -m -s 10` (`Ctrl-C` ends it); `docker stats` does not show build containers. Nothing has been measured. A guess: 15 to 40 minutes with two jobs, most of it in `main/` and pjproject, and a few hundred MB for each compiler process. The log ends the build stage with `All 94 modules in ast22/modules.txt were built.`
+   Watch memory from a second SSH session with `free -m -s 10` (`Ctrl-C` ends it); `docker stats` does not show build containers. Nothing has been measured. A guess: 15 to 40 minutes with two jobs, most of it in `main/` and pjproject, and a few hundred MB for each compiler process. The log ends the build stage with `All 95 modules in ast22/modules.txt were built.`
    - If "available" drops below about 200 MB, press `Ctrl-C` in the build session. If the log shows `Killed` or `signal 9`, the build has already stopped. Either way, build again with one job. The download and configure steps are cached, so it starts again at the compile:
      ```bash
      MAKE_JOBS=1 docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env build 2>&1 | tee ~/ast22-build.log
@@ -645,7 +647,7 @@ Pick a quiet time: no call and no Test D session. The 20.6 container keeps the l
 
 ```bash
 docker exec home-phone asterisk -rx "core show version"   # Asterisk 22.12.0 built by ...
-sh tests/check-ast22.sh                                    # PASS on every line; SKIP on the four Test D lines while Test D is off
+sh tests/check-ast22.sh                                    # PASS on every line; SKIP on the two Test D lines while Test D is off, and on the nine Ganpath lines unless Ganpath mode is on
 ```
 The script waits up to 30 s for the registration. If the container is not running or the registration FAILs, the line is down. For that or any other FAIL, save the log and roll back at once, then send the FAIL lines:
 ```bash
@@ -703,6 +705,133 @@ docker compose --env-file ../.env up -d --build
 docker exec home-phone asterisk -rx "core show version"   # Asterisk 20.6.0~dfsg...
 ```
 If `COMPOSE_FILE` is exported, `unset COMPOSE_FILE` first. `--build` copies the checkout's `config/` and `entrypoint.sh` into the 20.6 image. Without it, `up -d` starts the 20.6 image with the files of its last build, which can be older. With Ubuntu's package in the build cache, the rebuild takes seconds. After `docker builder prune` it installs the package again, which takes longer and needs the internet. Going back to 22.12 is the override's `up -d --build`, which after a prune compiles everything again, as in step 3.
+
+## Ganpath (stage 2, phase 1)
+
+Ganpath is the assistant service that answers calls. It runs in its own container on this host and controls calls over ARI on 127.0.0.1:8088. In phase 1 only test callers reach it. Everyone else hears ringing, as today.
+
+Ganpath mode is off unless `HOME_PHONE_TEST_MODE=ganpath`. With any other value (`menu`, `deflect`, unset), calls are handled exactly as before.
+
+### What it does
+
+With `HOME_PHONE_TEST_MODE=ganpath`:
+
+- A call from a number in `HOME_PHONE_TEST_CALLERS` goes to the Ganpath service (Stasis app `ganpath`, argument `inbound`) in place of the test menu. Every other caller rings, as today.
+- Before the hand-over, Asterisk starts a dead-man timer on the call (`TIMEOUT(absolute)`, `HOME_PHONE_GANPATH_DEADMAN_S`) and adds a hangup handler. The service renews the timer while it runs.
+- The call goes to the fallback (`[ganpath-fallback]`) when the service is not connected, when it stops renewing the timer, or when it sends the call there itself. The fallback:
+  1. alerts Home Assistant through `HOME_PHONE_HA_FALLBACK_WEBHOOK`, if it is set (2 s to connect, 3 s in all);
+  2. plays the recorded message `ganpath/ganpath-unavailable`;
+  3. records a voicemail after the beep. It ends after `HOME_PHONE_VM_SILENCE_S` of silence, at `HOME_PHONE_VM_MAX_S`, on `#`, or when the caller hangs up. The fallback's own timer is `HOME_PHONE_VM_MAX_S` plus 60 s.
+- A caller the service does not find on its own testers list goes back to `[inbound]`, label `ring`, and rings like any other caller. The service first cancels the dead-man timer and sets `GANPATH_DONE=1`, so this caller gets no fallback and no HA alert. Keep the service's testers list and `HOME_PHONE_TEST_CALLERS` the same people all the same.
+- The hangup handler alerts Home Assistant about a call that neither the service nor the fallback reported.
+- A sweep job in this container deletes each voicemail `HOME_PHONE_VM_RETENTION_H` hours after it was written, whether or not the service runs. It looks every `HOME_PHONE_VM_SWEEP_S` seconds.
+
+What Asterisk and the service share:
+
+| Item | Value |
+|---|---|
+| ARI user | `ganpath`, not read-only. It exists only while `HOME_PHONE_GANPATH_ARI_PASSWORD` is set. |
+| Stasis app | `ganpath`, argument `inbound` |
+| Channel variables | `GANPATH_DONE=1` (the service set it: the call is in its call log, or it sent the caller back to `ring`), `GANPATH_FALLBACK=1` (the fallback set it) |
+| Where the service sends calls | `ganpath-fallback,s,1`; a non-tester to `inbound`, `s`, label `ring` |
+| Prompts | the host folder `/srv/ganpath/prompts` (`HOME_PHONE_GANPATH_PROMPTS_DIR` moves it), mounted read-only at `/usr/share/asterisk/sounds/ganpath`. Asterisk plays `ganpath/<name>`. Files are WAV, 8 kHz, 16-bit, mono. The fallback needs `ganpath-unavailable.wav`. |
+| Voicemail | `/var/spool/asterisk/recording/voicemail/ganpath-vm-<epoch>-<id>-<tail>.wav`. `<epoch>` is the start time, `<id>` the channel's unique id with dots as hyphens (the HA alert sends it as `vm=`), `<tail>` the last 4 digits of the caller's number or `none`. ARI names it `voicemail/ganpath-vm-...`. |
+| Recording folder | `/var/spool/asterisk/recording`, a 64 MB tmpfs in RAM, shared with Test D4's key check. A 120 s voicemail is about 1.9 MB. A container restart clears it. |
+
+### Root .env names
+
+Type each value yourself. Empty or unset numbers take the default.
+
+| Name | Default | What it is |
+|---|---|---|
+| `HOME_PHONE_TEST_MODE` | `menu` | `ganpath` switches Ganpath mode on. |
+| `HOME_PHONE_GANPATH_ARI_PASSWORD` | empty | The ARI password of the user `ganpath`. A secret. The Ganpath service reads the same name from the root `.env`. Without it there is no `ganpath` user, and in Ganpath mode every test call goes to the fallback. |
+| `HOME_PHONE_HA_FALLBACK_WEBHOOK` | empty | The full Home Assistant webhook URL for fallback alerts. A secret: it holds a webhook ID. Empty: no alert is sent. |
+| `HOME_PHONE_GANPATH_DEADMAN_S` | 120 | The dead-man timer, in seconds. |
+| `HOME_PHONE_VM_MAX_S` | 120 | The longest voicemail, in seconds. |
+| `HOME_PHONE_VM_SILENCE_S` | 5 | Seconds of silence that end a voicemail. |
+| `HOME_PHONE_VM_RETENTION_H` | 48 | Hours a voicemail is kept. A fraction such as `0.5` works. |
+| `HOME_PHONE_VM_SWEEP_S` | 300 | Seconds between sweeps. |
+| `HOME_PHONE_GANPATH_PROMPTS_DIR` | `/srv/ganpath/prompts` | The host folder of Ganpath's prompts. It must be the folder the Ganpath service writes them to. Docker mounts it in every mode and creates it, empty and owned by root, when it is missing. |
+
+In Ganpath mode a value that is not a number stops the container, and `docker logs home-phone` names it. Leading zeros are dropped (`08` is 8). A webhook URL with a comma, `$`, `"`, `(`, `)`, `\` or a space also stops it: the URL goes unquoted into `CURL()`, where those characters would break the alert without an error.
+
+**The numbers must match the Ganpath service's settings.** The service keeps its own copy and does not read these. Print its values with `ganpath phone dialplan-vars` (in Ganpath's admin container) and compare:
+
+| `dialplan-vars` line | Root `.env` name |
+|---|---|
+| `GANPATH_DEADMAN_TIMEOUT` | `HOME_PHONE_GANPATH_DEADMAN_S` |
+| `GANPATH_VM_MAX` | `HOME_PHONE_VM_MAX_S` |
+| `GANPATH_VM_SILENCE` | `HOME_PHONE_VM_SILENCE_S` |
+| `GANPATH_VM_RETENTION_H` | `HOME_PHONE_VM_RETENTION_H` |
+| `GANPATH_VM_SWEEP_S` | `HOME_PHONE_VM_SWEEP_S` |
+| `GANPATH_FALLBACK_TIMEOUT` | none: the entrypoint uses `HOME_PHONE_VM_MAX_S` + 60 |
+
+After a change on either side, set the same value in the root `.env` and recreate the container (`up -d`).
+
+### Switch it on
+
+1. Make the ARI password and type it into the root `.env` yourself, without quotes:
+   ```bash
+   openssl rand -hex 24
+   ```
+   ```
+   HOME_PHONE_GANPATH_ARI_PASSWORD=<the output>
+   ```
+2. Put the approved prompt `ganpath-unavailable.wav` in `/srv/ganpath/prompts`. Asterisk runs as the user `asterisk` in the container, so give the folder, its subfolders (the greetings are in `greetings/`) and all their files that group, after the container is on the 22.12 image. The setgid bit (the `2` in 2750) makes files written later take the group too:
+   ```bash
+   G=$(docker exec home-phone id -g asterisk)
+   sudo chgrp -R "$G" /srv/ganpath/prompts
+   sudo find /srv/ganpath/prompts -type d -exec chmod 2750 {} +
+   ```
+   The group id comes from the image. After a build from scratch, run these lines again.
+   If the folder does not exist, Docker creates it empty, owned by root, and the container still starts. The fallback then plays only the beep.
+3. In the root `.env`, set `HOME_PHONE_TEST_MODE=ganpath`, and `HOME_PHONE_HA_FALLBACK_WEBHOOK` if you have the HA automation for it. Check the numbers against `ganpath phone dialplan-vars`.
+4. Rebuild and recreate from this folder. The line drops for about 10 s:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d --build
+   docker logs home-phone 2>&1 | grep -E 'Ganpath|sweep|WARNING'
+   ```
+   Good: `Ganpath ARI user on`, `Ganpath mode on: ...`, `voicemail sweep on: ...`, and no `WARNING`.
+5. Start or restart the Ganpath service, so it logs in as `ganpath`.
+
+### Checks
+
+```bash
+sh tests/check-ast22.sh                                                      # the nine Ganpath lines PASS
+docker exec home-phone asterisk -rx "ari show users"                         # No    No    ganpath
+docker exec home-phone asterisk -rx "dialplan show ganpath@inbound"          # Stasis(ganpath,inbound)
+docker exec home-phone asterisk -rx "dialplan show ganpath-fallback" | tail -1   # -= 3 extensions (17 priorities) in 1 context. =-
+docker exec home-phone asterisk -rx "module show like app_record.so"         # Running
+docker exec home-phone df -h /var/spool/asterisk/recording | tail -1         # 64M
+docker exec -u asterisk home-phone head -c 4 /usr/share/asterisk/sounds/ganpath/ganpath-unavailable.wav; echo   # RIFF
+docker exec home-phone asterisk -rx "ari show apps"                          # ganpath, once the service is connected
+```
+
+Keep `| tail -1` on `dialplan show ganpath-fallback`, and do not run `dialplan show ganpath-hangup`, once a webhook is set: the full output prints the webhook URL to anyone at the console. The start lines and `check-ast22.sh` never print it.
+
+The voicemail line in the log comes from the fallback's `h` extension, so it appears however the call ends: `Voicemail from a number ending in 1234: HANGUP` (or `SILENCE`, `DTMF`, `TIMEOUT`). An empty status means the caller hung up before the beep.
+
+The sweep prints a line only when it deletes something: `docker logs home-phone 2>&1 | grep vm-sweep`. It runs in the background beside Asterisk and nothing restarts it. It stops only on a bad setting, which the entrypoint checks first, or if it is killed. `check-ast22.sh` has the line `voicemail sweep running`; if that line fails, recreate the container (`up -d`) and voicemails are deleted on time again. To list voicemails waiting in memory: `docker exec home-phone ls -l /var/spool/asterisk/recording/voicemail`. The names hold only the last 4 digits.
+
+### Switch it off (rollback)
+
+1. Set `HOME_PHONE_TEST_MODE=menu` in the root `.env`.
+2. `docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d`
+3. Check: `docker logs home-phone 2>&1 | grep 'Ganpath mode on'` prints nothing for the new start, and a test call reaches the menu.
+
+The recreate empties the recording tmpfs, so a voicemail the service has not fetched yet is lost. To remove the ARI user too, empty `HOME_PHONE_GANPATH_ARI_PASSWORD` as well. With the password, the web server and the `ganpath` user stay on in menu mode; no call reaches Ganpath.
+
+### With Test D
+
+- Test D needs the menu. Option 4 is reached only in menu mode, so for line tests set `HOME_PHONE_TEST_MODE=menu`, recreate, run Test D, then set `ganpath` back.
+- The two ARI users can exist at once. Each has its own password: Test D's script logs in as `homephone`, Ganpath as `ganpath`. Hold passthrough (`moh_passthrough`) follows `HOME_PHONE_ARI_PASSWORD` only.
+- `tests/testd.py --wait-in` (E2) takes test callers before Ganpath does while it waits. Do not run it in Ganpath mode.
+- Test D4's key check and the voicemails share the 64 MB recording tmpfs. The key check uses up to about 16 MB.
+
+### Not checked on a running Asterisk yet
+
+The dialplan was checked against the Asterisk 22.12.0 source and docs, not run. Still to see on the box: the `T` extension taking a caller from `Stasis()` to the fallback when the timer runs out; `Record()` keeping the file on hang-up with option `k`; `REPLACE()`, `FILTER()` and `${EPOCH}` in the file name; `CURL()` with the timeouts; ARI listing and fetching a recording in the `voicemail/` folder; and the sweep's `find` and `awk` in the image.
 
 ## Troubleshooting
 
