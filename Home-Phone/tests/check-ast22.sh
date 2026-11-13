@@ -4,9 +4,9 @@
 #   sh tests/check-ast22.sh
 # One line per check: PASS, FAIL, or SKIP for a Test D check while Test D is off
 # (HOME_PHONE_ARI_PASSWORD empty) and for a Ganpath check unless the container runs with
-# HOME_PHONE_TEST_MODE=ganpath. It reads both from the container's environment without
-# printing them. It prints only its own labels, so no number, address or password from a
-# command's output reaches the terminal. Exit status 1 if any check failed.
+# HOME_PHONE_TEST_MODE=ganpath or ganpath_all. It reads both from the container's
+# environment without printing them. It prints only its own labels, so no number, address
+# or password from a command's output reaches the terminal. Exit status 1 if any check failed.
 set -u
 
 C=home-phone
@@ -115,7 +115,9 @@ has "function PJSIP_HEADER" "core show function PJSIP_HEADER" \
 # The web server: on while Test D or Ganpath has an ARI password.
 testd=no; envset HOME_PHONE_ARI_PASSWORD && testd=yes
 gari=no; envset HOME_PHONE_GANPATH_ARI_PASSWORD && gari=yes
-gmode=no; envis HOME_PHONE_TEST_MODE ganpath && gmode=yes
+gmode=no
+envis HOME_PHONE_TEST_MODE ganpath && gmode=yes
+envis HOME_PHONE_TEST_MODE ganpath_all && gmode=yes
 http=$(cli "http show status")
 if [ "$testd" = no ] && [ "$gari" = no ]; then
     if printf '%s\n' "$http" | grep -q 'Server Disabled'; then
@@ -155,11 +157,16 @@ else
         'moh_passthrough[[:space:]]*:[[:space:]]*true'
 fi
 
-# Ganpath (README, "Ganpath (stage 2, phase 1)"). Only with HOME_PHONE_TEST_MODE=ganpath.
+# Ganpath (README, "Ganpath (stage 2, phase 1)"). Only with HOME_PHONE_TEST_MODE=ganpath or
+# ganpath_all; every line is the same in both, because the ganpath_all jump is in the
+# dialplan in both modes (it only fires in ganpath_all).
 G_CHECKS="ARI user ganpath, not read-only
 dialplan [inbound] has extensions ganpath and T
+dialplan [inbound] has the ganpath_all jump
+global GANPATH_EVERYONE is 0 or 1
 dialplan [ganpath-fallback] loaded
 dialplan [ganpath-hangup] loaded
+dialplan [ganpath-down] loaded, ring label cancels the dead-man timer
 prompts folder mounted read-only at sounds/ganpath
 prompt ganpath-unavailable.wav readable by asterisk, a WAV file
 recording tmpfs is 64M
@@ -174,15 +181,34 @@ else
         fail "ARI user ganpath, not read-only"
     fi
     if cli "dialplan show ganpath@inbound" | grep -q "Stasis(ganpath,inbound)" \
-        && cli "dialplan show T@inbound" | grep -q "Goto(ganpath-fallback,s,1)"; then
+        && cli "dialplan show T@inbound" | grep -q "Goto(inbound,ganpath,down)"; then
         pass "dialplan [inbound] has extensions ganpath and T"
     else
         fail "dialplan [inbound] has extensions ganpath and T"
     fi
+    # The jump that sends a caller who is not a test caller to Ganpath in ganpath_all mode,
+    # and the step that sends one back to ring when the service is down while the service
+    # has not set GANPATH_EVERYONE=1.
+    if cli "dialplan show s@inbound" | grep -qF 'GotoIf($["${TEST_MODE}" = "ganpath_all"]?ganpath,1)' \
+        && cli "dialplan show ganpath@inbound" | grep -qF 'GotoIf($["${GANPATH_EVERYONE}" = "1"]?ganpath-fallback,s,1)' \
+        && cli "dialplan show ganpath@inbound" | grep -q 'Goto(inbound,s,ring)'; then
+        pass "dialplan [inbound] has the ganpath_all jump"
+    else
+        fail "dialplan [inbound] has the ganpath_all jump"
+    fi
+    has "global GANPATH_EVERYONE is 0 or 1" "dialplan show globals" 'GANPATH_EVERYONE=[01]([[:space:]]|$)'
     has "dialplan [ganpath-fallback] loaded" "dialplan show ganpath-fallback" \
         "Context 'ganpath-fallback' created by 'pbx_config'"
     has "dialplan [ganpath-hangup] loaded" "dialplan show ganpath-hangup" \
         "Context 'ganpath-hangup' created by 'pbx_config'"
+    # The service sends a caller it lets go of to [ganpath-down] (label down), and the ring
+    # label cancels the dead-man timer once the caller has left Stasis.
+    if cli "dialplan show s@ganpath-down" | grep -q 'Goto(inbound,ganpath,down)' \
+        && cli "dialplan show s@inbound" | grep -qF 'Set(TIMEOUT(absolute)=0)'; then
+        pass "dialplan [ganpath-down] loaded, ring label cancels the dead-man timer"
+    else
+        fail "dialplan [ganpath-down] loaded, ring label cancels the dead-man timer"
+    fi
     mounts=$(docker inspect -f '{{range .Mounts}}{{.Destination}} {{.RW}}{{"\n"}}{{end}}' "$C" 2>/dev/null)
     if printf '%s\n' "$mounts" | grep -qx '/usr/share/asterisk/sounds/ganpath false'; then
         pass "prompts folder mounted read-only at sounds/ganpath"

@@ -12,8 +12,8 @@ set -eu
 : "${HOME_PHONE_TEST_FORWARD:=}"
 : "${HOME_PHONE_TEST_MODE:=menu}"
 : "${HOME_PHONE_ARI_PASSWORD:=}"
-# Ganpath (README, "Ganpath (stage 2, phase 1)"). Used only with HOME_PHONE_TEST_MODE=ganpath,
-# apart from the ARI password. The defaults match the Ganpath service's own settings
+# Ganpath (README, "Ganpath (stage 2, phase 1)"). Used only with HOME_PHONE_TEST_MODE=ganpath
+# or ganpath_all, apart from the ARI password. The defaults match the Ganpath service's own settings
 # (`ganpath phone dialplan-vars`); a changed setting there must be changed here too.
 : "${HOME_PHONE_GANPATH_ARI_PASSWORD:=}"
 : "${HOME_PHONE_HA_FALLBACK_WEBHOOK:=}"
@@ -69,9 +69,19 @@ whole() {
     fi
 }
 
+# Ganpath mode (ganpath: test callers only; ganpath_all: every caller reaches the service,
+# which decides whom it answers). ganpath_on is yes in both.
+case "$HOME_PHONE_TEST_MODE" in
+    ganpath | ganpath_all) ganpath_on=yes ;;
+    menu | deflect) ganpath_on=no ;;
+    *)
+        ganpath_on=no
+        echo "home-phone: WARNING: HOME_PHONE_TEST_MODE is not menu, deflect, ganpath or ganpath_all; calls are handled as in menu mode" >&2 ;;
+esac
+
 # Ganpath mode: check the values before anything is rendered, so a bad one stops the
 # container with a clear message instead of a broken dialplan.
-if [ "$HOME_PHONE_TEST_MODE" = ganpath ]; then
+if [ "$ganpath_on" = yes ]; then
     whole HOME_PHONE_GANPATH_DEADMAN_S "$HOME_PHONE_GANPATH_DEADMAN_S"
     whole HOME_PHONE_VM_MAX_S "$HOME_PHONE_VM_MAX_S"
     whole HOME_PHONE_VM_SILENCE_S "$HOME_PHONE_VM_SILENCE_S"
@@ -144,7 +154,7 @@ if [ -n "$HOME_PHONE_GANPATH_ARI_PASSWORD" ]; then
 fi
 
 mkdir -p /var/run/asterisk /var/log/asterisk
-if [ "$HOME_PHONE_TEST_MODE" = ganpath ]; then
+if [ "$ganpath_on" = yes ]; then
     # The voicemail folder in the recording tmpfs. Record() would make it too; made here so
     # ARI and the sweep find it before the first voicemail.
     mkdir -p /var/spool/asterisk/recording/voicemail
@@ -154,9 +164,14 @@ chown -R asterisk:asterisk /etc/asterisk /var/run/asterisk /var/log/asterisk \
 # extensions.conf can hold the HA fallback webhook URL, which carries a webhook ID.
 chmod 600 /etc/asterisk/pjsip.conf /etc/asterisk/ari.conf /etc/asterisk/extensions.conf
 
-if [ "$HOME_PHONE_TEST_MODE" = ganpath ]; then
+if [ "$ganpath_on" = yes ]; then
+    if [ "$HOME_PHONE_TEST_MODE" = ganpath_all ]; then
+        who="everyone"
+    else
+        who="testers"
+    fi
     if [ "$HOME_PHONE_GANPATH_HA_ALERT" = 1 ]; then alert=on; else alert="off (HOME_PHONE_HA_FALLBACK_WEBHOOK is not set)"; fi
-    echo "home-phone: Ganpath mode on: test callers go to Stasis(ganpath); dead-man ${HOME_PHONE_GANPATH_DEADMAN_S} s; voicemail up to ${HOME_PHONE_VM_MAX_S} s, ends after ${HOME_PHONE_VM_SILENCE_S} s of silence; HA fallback alert $alert"
+    echo "home-phone: Ganpath mode on: $who; callers sent to Stasis(ganpath); dead-man ${HOME_PHONE_GANPATH_DEADMAN_S} s; voicemail up to ${HOME_PHONE_VM_MAX_S} s, ends after ${HOME_PHONE_VM_SILENCE_S} s of silence; HA fallback alert $alert"
     if [ -z "$HOME_PHONE_GANPATH_ARI_PASSWORD" ]; then
         echo "home-phone: WARNING: HOME_PHONE_GANPATH_ARI_PASSWORD is not set, so the Ganpath service cannot connect and every test call goes to the fallback"
     fi

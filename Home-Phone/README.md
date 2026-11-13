@@ -11,7 +11,7 @@ The fibre landline that comes with the broadband connection, run from this host 
 
 [Asterisk 22.12](#asterisk-2212-stage-2-phase-7) is an opt-in image for the rest of stage 2; the default build stays on Ubuntu's Asterisk 20.6.
 
-[Ganpath mode](#ganpath-stage-2-phase-1) sends test callers to the Ganpath assistant service in place of the test menu. It stays off unless you switch it on.
+[Ganpath mode](#ganpath-stage-2-phase-1) sends test callers (or, in `ganpath_all`, every caller) to the Ganpath assistant service in place of the test menu. It stays off unless you switch it on.
 
 ## Why it is built this way
 
@@ -647,7 +647,7 @@ Pick a quiet time: no call and no Test D session. The 20.6 container keeps the l
 
 ```bash
 docker exec home-phone asterisk -rx "core show version"   # Asterisk 22.12.0 built by ...
-sh tests/check-ast22.sh                                    # PASS on every line; SKIP on the two Test D lines while Test D is off, and on the nine Ganpath lines unless Ganpath mode is on
+sh tests/check-ast22.sh                                    # PASS on every line; SKIP on the two Test D lines while Test D is off, and on the twelve Ganpath lines unless Ganpath mode is on
 ```
 The script waits up to 30 s for the registration. If the container is not running or the registration FAILs, the line is down. For that or any other FAIL, save the log and roll back at once, then send the FAIL lines:
 ```bash
@@ -708,9 +708,9 @@ If `COMPOSE_FILE` is exported, `unset COMPOSE_FILE` first. `--build` copies the 
 
 ## Ganpath (stage 2, phase 1)
 
-Ganpath is the assistant service that answers calls. It runs in its own container on this host and controls calls over ARI on 127.0.0.1:8088. In phase 1 only test callers reach it. Everyone else hears ringing, as today.
+Ganpath is the assistant service that answers calls. It runs in its own container on this host and controls calls over ARI on 127.0.0.1:8088. With `HOME_PHONE_TEST_MODE=ganpath` only test callers reach it, and everyone else hears ringing, as today. With `ganpath_all` every caller reaches it and the service decides whom it answers (see [Everyone mode](#everyone-mode-ganpath_all)).
 
-Ganpath mode is off unless `HOME_PHONE_TEST_MODE=ganpath`. With any other value (`menu`, `deflect`, unset), calls are handled exactly as before.
+Ganpath mode is off unless `HOME_PHONE_TEST_MODE` is `ganpath` or `ganpath_all`. With any other value (`menu`, `deflect`, unset), calls are handled exactly as before. A value that is none of the four is treated as `menu`, and the container logs a WARNING.
 
 ### What it does
 
@@ -732,11 +732,39 @@ What Asterisk and the service share:
 |---|---|
 | ARI user | `ganpath`, not read-only. It exists only while `HOME_PHONE_GANPATH_ARI_PASSWORD` is set. |
 | Stasis app | `ganpath`, argument `inbound` |
-| Channel variables | `GANPATH_DONE=1` (the service set it: the call is in its call log, or it sent the caller back to `ring`), `GANPATH_FALLBACK=1` (the fallback set it) |
-| Where the service sends calls | `ganpath-fallback,s,1`; a non-tester to `inbound`, `s`, label `ring` |
+| Channel variables | `GANPATH_DONE=1` (the service set it: the call is in its call log, or it sent the caller back to `ring`; the down-service step sets it before it sends a non-test caller to `ring`), `GANPATH_FALLBACK=1` (the fallback set it), `GP_TESTER` (the dialplan set it: 1 for a test caller, 0 for anyone else; read only by the down-service step) |
+| Global variable | `GANPATH_EVERYONE`. The service sets it over ARI (`POST /ari/asterisk/variable?variable=GANPATH_EVERYONE&value=1`) when it starts and whenever its setting `answer.callers` changes: `1` for `everyone`, `0` for `testers`. Asterisk starts it at 0. Only `ganpath_all` mode reads it. |
+| Where the service sends calls | `ganpath-fallback,s,1` for a caller it answers; a non-tester to `inbound`, `s`, label `ring`; a caller it lets go of before it answers them (a failed start, a call while it stops, its restart clean-up) to `ganpath-down`, label `down`, which makes the same choice as a down service. The `ring` label cancels the dead-man timer, so a continue the service could not send leaves the timer to ring the caller. |
 | Prompts | the host folder `/srv/ganpath/prompts` (`HOME_PHONE_GANPATH_PROMPTS_DIR` moves it), mounted read-only at `/usr/share/asterisk/sounds/ganpath`. Asterisk plays `ganpath/<name>`. Files are WAV, 8 kHz, 16-bit, mono. The fallback needs `ganpath-unavailable.wav`. |
 | Voicemail | `/var/spool/asterisk/recording/voicemail/ganpath-vm-<epoch>-<id>-<tail>.wav`. `<epoch>` is the start time, `<id>` the channel's unique id with dots as hyphens (the HA alert sends it as `vm=`), `<tail>` the last 4 digits of the caller's number or `none`. ARI names it `voicemail/ganpath-vm-...`. |
 | Recording folder | `/var/spool/asterisk/recording`, a 64 MB tmpfs in RAM, shared with Test D4's key check. A 120 s voicemail is about 1.9 MB. A container restart clears it. |
+
+### Everyone mode (`ganpath_all`)
+
+With `HOME_PHONE_TEST_MODE=ganpath_all`:
+
+- Every caller goes to `Stasis(ganpath)`. A test caller goes there first in the dialplan. Any other caller, a withheld or short number too, goes there from the `not_test` step. A call in while `tests/testd.py --wait-in` waits still rings for a non-test caller.
+- Who the service answers is its own setting, `answer.callers`: `testers` or `everyone`. While it is `testers`, the service sends a non-tester back to `[inbound]`, label `ring`, within about 100 ms. The caller rings as today, and the service writes nothing about the call.
+- What a caller gets when the service is down, or stops renewing the dead-man timer, depends on `GANPATH_EVERYONE`:
+
+| Caller | `GANPATH_EVERYONE` 0 (service says `testers`, or has not said) | `GANPATH_EVERYONE` 1 (service says `everyone`) |
+|---|---|---|
+| Test caller | fallback message and voicemail | fallback message and voicemail |
+| Anyone else | rings, never hears the fallback, no HA alert | fallback message and voicemail |
+
+  So the first step of the turn-on order below changes nothing a real caller can notice, even if the service dies. Only after the service has set `GANPATH_EVERYONE=1` does a down service mean the fallback for everyone.
+- `GANPATH_EVERYONE` lives in Asterisk's memory. An Asterisk restart or `dialplan reload` puts it back to 0. The service sets it again when it reconnects, and every few seconds while it runs (its setting `jobs.admin_poll_s`). In that gap a real caller rings, which is what they get today.
+- `ganpath` mode is unchanged: test callers only, and anyone else never enters Stasis.
+
+Turn-on order:
+
+1. Set `HOME_PHONE_TEST_MODE=ganpath_all` in the root `.env` and recreate the container (about 10 s of dropped line). The service's `answer.callers` is still `testers`. Real callers enter Stasis and are sent back to ring. This soaks the hop.
+2. Check `docker exec home-phone asterisk -rx "dialplan show globals" | grep GANPATH_EVERYONE` says `0`, and `sh tests/check-ast22.sh` passes.
+3. Run `ganpath settings set answer.callers everyone` (a family heads-up first: from now on Ganpath answers). The global turns to `1`.
+
+Turn-off: `ganpath settings set answer.callers testers` (instant; the global turns to `0`), or `HOME_PHONE_TEST_MODE=ganpath` or `menu` and recreate.
+
+The `HOME_PHONE_TEST_CALLERS` list is still the dialplan's test callers. In `ganpath_all` it decides only what a down service does for a caller while `GANPATH_EVERYONE` is 0. Keep it the same people as the service's testers list. A demo number that is not a test caller reaches the service in `ganpath_all` but not in `ganpath`.
 
 ### Root .env names
 
@@ -744,7 +772,7 @@ Type each value yourself. Empty or unset numbers take the default.
 
 | Name | Default | What it is |
 |---|---|---|
-| `HOME_PHONE_TEST_MODE` | `menu` | `ganpath` switches Ganpath mode on. |
+| `HOME_PHONE_TEST_MODE` | `menu` | `ganpath` switches Ganpath mode on for test callers. `ganpath_all` sends every caller to the service (see [Everyone mode](#everyone-mode-ganpath_all)). |
 | `HOME_PHONE_GANPATH_ARI_PASSWORD` | empty | The ARI password of the user `ganpath`. A secret. The Ganpath service reads the same name from the root `.env`. Without it there is no `ganpath` user, and in Ganpath mode every test call goes to the fallback. |
 | `HOME_PHONE_HA_FALLBACK_WEBHOOK` | empty | The full Home Assistant webhook URL for fallback alerts. A secret: it holds a webhook ID. Empty: no alert is sent. |
 | `HOME_PHONE_GANPATH_DEADMAN_S` | 120 | The dead-man timer, in seconds. |
@@ -786,7 +814,7 @@ After a change on either side, set the same value in the root `.env` and recreat
    ```
    The group id comes from the image. After a build from scratch, run these lines again.
    If the folder does not exist, Docker creates it empty, owned by root, and the container still starts. The fallback then plays only the beep.
-3. In the root `.env`, set `HOME_PHONE_TEST_MODE=ganpath`, and `HOME_PHONE_HA_FALLBACK_WEBHOOK` if you have the HA automation for it. Check the numbers against `ganpath phone dialplan-vars`.
+3. In the root `.env`, set `HOME_PHONE_TEST_MODE=ganpath` (or `ganpath_all`, see [Everyone mode](#everyone-mode-ganpath_all) for the order), and `HOME_PHONE_HA_FALLBACK_WEBHOOK` if you have the HA automation for it. Check the numbers against `ganpath phone dialplan-vars`.
 4. Rebuild and recreate from this folder. The line drops for about 10 s:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.ast22.yml --env-file ../.env up -d --build
@@ -798,7 +826,7 @@ After a change on either side, set the same value in the root `.env` and recreat
 ### Checks
 
 ```bash
-sh tests/check-ast22.sh                                                      # the nine Ganpath lines PASS
+sh tests/check-ast22.sh                                                      # the eleven Ganpath lines PASS
 docker exec home-phone asterisk -rx "ari show users"                         # No    No    ganpath
 docker exec home-phone asterisk -rx "dialplan show ganpath@inbound"          # Stasis(ganpath,inbound)
 docker exec home-phone asterisk -rx "dialplan show ganpath-fallback" | tail -1   # -= 3 extensions (17 priorities) in 1 context. =-
@@ -826,12 +854,12 @@ The recreate empties the recording tmpfs, so a voicemail the service has not fet
 
 - Test D needs the menu. Option 4 is reached only in menu mode, so for line tests set `HOME_PHONE_TEST_MODE=menu`, recreate, run Test D, then set `ganpath` back.
 - The two ARI users can exist at once. Each has its own password: Test D's script logs in as `homephone`, Ganpath as `ganpath`. Hold passthrough (`moh_passthrough`) follows `HOME_PHONE_ARI_PASSWORD` only.
-- `tests/testd.py --wait-in` (E2) takes test callers before Ganpath does while it waits. Do not run it in Ganpath mode.
+- `tests/testd.py --wait-in` (E2) takes test callers before Ganpath does while it waits. It stays menu-only: do not run it in `ganpath` or `ganpath_all` mode.
 - Test D4's key check and the voicemails share the 64 MB recording tmpfs. The key check uses up to about 16 MB.
 
 ### Not checked on a running Asterisk yet
 
-The dialplan was checked against the Asterisk 22.12.0 source and docs, not run. Still to see on the box: the `T` extension taking a caller from `Stasis()` to the fallback when the timer runs out; `Record()` keeping the file on hang-up with option `k`; `REPLACE()`, `FILTER()` and `${EPOCH}` in the file name; `CURL()` with the timeouts; ARI listing and fetching a recording in the `voicemail/` folder; and the sweep's `find` and `awk` in the image.
+The dialplan was checked against the Asterisk 22.12.0 source and docs, not run. Still to see on the box: the `T` extension taking a caller from `Stasis()` to the fallback when the timer runs out, and (in `ganpath_all` with `GANPATH_EVERYONE=0`) a non-test caller to `ring` instead; `Set` of the global over ARI (`POST /asterisk/variable`) and its effect on the next call; `Record()` keeping the file on hang-up with option `k`; `REPLACE()`, `FILTER()` and `${EPOCH}` in the file name; `CURL()` with the timeouts; ARI listing and fetching a recording in the `voicemail/` folder; and the sweep's `find` and `awk` in the image.
 
 ## Troubleshooting
 
