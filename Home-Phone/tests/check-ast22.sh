@@ -107,6 +107,25 @@ fi
 has "dialplan [inbound] loaded" "dialplan show inbound" "Context 'inbound' created by 'pbx_config'"
 has "dialplan [testd-refer]: 3 priorities" "dialplan show testd-refer" \
     '-= 1 extension \(3 priorities\) in 1 context\. =-'
+# Ganpath phase 4: the merge's REFER context (README, "Merged calls").
+if cli "dialplan show s@ganpath-refer" | grep -qF 'Transfer(PJSIP/${GANPATH_REFER_TO})' \
+    && cli "dialplan show s@ganpath-refer" | grep -qF 'Stasis(ganpath,referred'; then
+    pass "dialplan [ganpath-refer]: Transfer and Stasis referred"
+else
+    fail "dialplan [ganpath-refer]: Transfer and Stasis referred"
+fi
+# Ganpath phase 5, rule 22: no PIN digit in a log. logger.conf has no debug or dtmf on any
+# channel, and the running logger shows none either.
+if ! grep -Eq '(^|[ ,=>])(debug|dtmf)([ ,]|$)' "$(dirname "$0")/../config/logger.conf"; then
+    pass "logger.conf has no debug or dtmf level"
+else
+    fail "logger.conf has no debug or dtmf level"
+fi
+if ! cli "logger show channels" | grep -Eqi 'debug|dtmf'; then
+    pass "running logger shows no debug or dtmf channel"
+else
+    fail "running logger shows no debug or dtmf channel"
+fi
 has "function PJSIP_RESPONSE_HEADER" "core show function PJSIP_RESPONSE_HEADER" \
     "Info about Function 'PJSIP_RESPONSE_HEADER'"
 has "function PJSIP_HEADER" "core show function PJSIP_HEADER" \

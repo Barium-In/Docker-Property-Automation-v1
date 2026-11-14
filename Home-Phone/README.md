@@ -223,6 +223,17 @@ docker exec home-phone sh -c 'rm -f /var/spool/asterisk/recording/testd-keys-*'
 The `sh -c` lets the container's own shell expand the `*`. The folder is a tmpfs, so restarting the container also clears it.
 Docker's own copy rotates away after 30 MB. To drop it now, recreate the container: `docker compose --env-file ../.env up -d --force-recreate`.
 
+### Keypad PINs (Ganpath phase 5)
+
+Family members type a PIN on the keypad during a call. Key events are printed by these debug
+commands: `rtp set debug`, `core set debug`, `ari set debug` and `pjsip set logger`. Run them only when
+no PIN entry is expected. Afterwards truncate the log:
+
+    docker exec home-phone sh -c ': > /var/log/asterisk/messages.log'
+
+`config/logger.conf` keeps no `debug` and no `dtmf` level on any channel, so a PIN digit never reaches
+`messages.log` in normal running.
+
 ### Switch it off (rollback)
 
 1. Empty `HOME_PHONE_ARI_PASSWORD` in the root `.env`, or delete the line.
@@ -849,6 +860,14 @@ The sweep prints a line only when it deletes something: `docker logs home-phone 
 3. Check: `docker logs home-phone 2>&1 | grep 'Ganpath mode on'` prints nothing for the new start, and a test call reaches the menu.
 
 The recreate empties the recording tmpfs, so a voicemail the service has not fetched yet is lost. To remove the ARI user too, empty `HOME_PHONE_GANPATH_ARI_PASSWORD` as well. With the password, the web server and the `ganpath` user stay on in menu mode; no call reaches Ganpath.
+
+### Merged calls (`[ganpath-refer]`, phase 4)
+
+`[ganpath-refer]` in `config/extensions.conf` sends the REFER for leg 3 of a network-conference merge. The service sets `GANPATH_REFER_TO` on the channel, continues it to this context by the label `refer`, and gets the result back from `Stasis(ganpath,referred,...)`. Only ARI reaches the context. It needs no new module and no change to `pjsip.conf`, the entrypoint or `ast22/modules.txt`. An image built without it answers the continue with a 404, and the service then sends no REFER.
+
+A merged call survives a Ganpath restart but not an Asterisk restart, so `hp up -d` waits until no merged call runs:
+
+    docker exec ganpath-phone ganpath health | grep -A3 '"line"'
 
 ### With Test D
 
