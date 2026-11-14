@@ -70,13 +70,6 @@ docker exec home-phone asterisk -rx "channel originate PJSIP/+91XXXXXXXXXX@airte
 ```
 If the carrier rejects the `+91` form, try `0XXXXXXXXXX`.
 
-**Owner call.** Ring the number in `HOME_PHONE_TEST_FORWARD` and play Ganpath's recorded line `ganpath-owner-call` twice (asking you to come back to the computer). It falls back to "hello world" while that prompt is not rendered. The line carries one call at a time, so check that nothing is up first:
-```bash
-docker exec home-phone asterisk -rx "core show channels count" | grep -q '^0 active call' \
-  && docker exec home-phone asterisk -rx "channel originate Local/s@owner-call-dial/n extension s@owner-call-say"
-```
-The log shows `Owner call to the number ending in ...` and `OWNER CALL RESULT`.
-
 ## Test D: hold, then dial
 
 The line refuses a second call while one is active (488) and refuses transfers (405). Test D checks whether it carries a second call once the first is on SIP hold, the way a phone does call waiting and 3-way calls. The answer decides how Ganpath can reach a family member's mobile.
